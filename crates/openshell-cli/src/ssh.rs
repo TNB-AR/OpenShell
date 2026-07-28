@@ -308,22 +308,12 @@ pub async fn sandbox_connect_editor(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<()> {
-    // Verify the sandbox exists before writing SSH config / launching the editor.
-    let mut client = grpc_client(server, tls).await?;
-    client
-        .get_sandbox(GetSandboxRequest {
-            name: name.to_string(),
-            workspace: workspace.to_string(),
-        })
-        .await
-        .into_diagnostic()?
-        .into_inner()
-        .sandbox
-        .ok_or_else(|| miette::miette!("sandbox not found: {name}"))?;
+    let session = ssh_session_config(server, name, tls, workspace).await?;
+    let workspace_root = discover_workspace_root(&session).await?;
 
     let host_alias = host_alias(name, workspace);
     install_ssh_config(gateway, name, workspace)?;
-    launch_editor(editor, &host_alias)?;
+    launch_editor(editor, &host_alias, &workspace_root)?;
     eprintln!(
         "{} Opened {} for sandbox {}",
         "✓".green().bold(),
@@ -776,9 +766,8 @@ fn local_upload_path_is_file_like(path: &Path) -> bool {
 /// sandbox.  Callers are responsible for splitting the destination path so
 /// that `dest_dir` is always a directory.
 ///
-/// When `dest_dir` is `None`, the sandbox user's home directory (`$HOME`) is
-/// used as the extraction target.  This avoids hard-coding any particular
-/// path and works for custom container images with non-default `WORKDIR`.
+/// When `dest_dir` is `None`, the canonical remote workspace is discovered
+/// from the SSH session and used as the extraction target.
 async fn ssh_tar_upload(
     server: &str,
     name: &str,
@@ -789,9 +778,14 @@ async fn ssh_tar_upload(
 ) -> Result<()> {
     let session = ssh_session_config(server, name, tls, workspace).await?;
 
-    // When no explicit destination is given, use the unescaped `$HOME` shell
-    // variable so the remote shell resolves it at runtime.
-    let escaped_dest = dest_dir.map_or_else(|| "$HOME".to_string(), shell_escape);
+    let discovered_workspace;
+    let dest_dir = if let Some(dest_dir) = dest_dir {
+        dest_dir
+    } else {
+        discovered_workspace = discover_workspace_root(&session).await?;
+        &discovered_workspace
+    };
+    let escaped_dest = shell_escape(dest_dir);
 
     let mut ssh = ssh_base_command(&session.proxy_command);
     ssh.arg("-T")
@@ -844,10 +838,6 @@ fn split_sandbox_path(path: &str) -> (&str, &str) {
     }
 }
 
-/// Writable root inside every sandbox. Used as the boundary for path-traversal
-/// checks on sandbox-side source paths in download flows.
-const SANDBOX_WORKSPACE_ROOT: &str = "/sandbox";
-
 /// Lexically clean a POSIX-style absolute path by resolving `.` and `..`
 /// components, collapsing repeated separators, and stripping any trailing
 /// slash. Returns `None` if the input is empty or relative — the caller is
@@ -887,44 +877,45 @@ fn lexical_clean_absolute_path(path: &str) -> Option<String> {
 /// resolves under the sandbox writable root.
 ///
 /// Returns the cleaned, traversal-resolved path on success. Refuses any
-/// path that lexically escapes `/sandbox` (e.g. `/etc/passwd`,
-/// `/sandbox/../etc/passwd`) with a user-facing error.
+/// path that lexically escapes the discovered workspace root with a
+/// user-facing error.
 ///
 /// This is a lexical guard only — it does not follow symlinks. Call
 /// `resolve_sandbox_source_path` after this on any path that will be passed
-/// to a subsequent SSH I/O operation, so a symlink such as
-/// `/sandbox/etc-link -> /etc` cannot leak files outside the workspace.
-fn validate_sandbox_source_path(path: &str) -> Result<String> {
+/// to a subsequent SSH I/O operation, so a workspace symlink to `/etc` cannot
+/// leak files outside the workspace.
+fn validate_sandbox_source_path(path: &str, workspace_root: &str) -> Result<String> {
     if path.is_empty() {
         return Err(miette::miette!("sandbox source path is empty"));
     }
     let cleaned = lexical_clean_absolute_path(path)
         .ok_or_else(|| miette::miette!("sandbox source path must be absolute (got '{path}')"))?;
-    if !is_under_sandbox_workspace(&cleaned) {
+    if !is_under_workspace(&cleaned, workspace_root) {
         return Err(miette::miette!(
-            "sandbox source path '{path}' is outside the sandbox workspace ({SANDBOX_WORKSPACE_ROOT})"
+            "sandbox source path '{path}' is outside the sandbox workspace ({workspace_root})"
         ));
     }
     Ok(cleaned)
 }
 
-/// Pure helper: is `path` equal to `/sandbox` or a descendant of it?
-fn is_under_sandbox_workspace(path: &str) -> bool {
-    path == SANDBOX_WORKSPACE_ROOT || path.starts_with(&format!("{SANDBOX_WORKSPACE_ROOT}/"))
+/// Pure helper: is `path` equal to the workspace root or a descendant of it?
+fn is_under_workspace(path: &str, workspace_root: &str) -> bool {
+    path == workspace_root || path.starts_with(&format!("{workspace_root}/"))
 }
 
 /// Resolve every symlink in `sandbox_path` on the sandbox side and refuse the
-/// result if it lands outside `/sandbox`.
+/// result if it lands outside the discovered workspace root.
 ///
 /// The lexical guard in `validate_sandbox_source_path` cannot see symlinks; a
-/// path such as `/sandbox/etc-link/passwd` (where `etc-link -> /etc`) clears
-/// the lexical check but would still leak `/etc/passwd` once `tar -C` follows
-/// the link. Resolving symlinks on the remote side and re-validating closes
-/// that gap. The returned fully-resolved path is what the caller should hand
-/// to probe and tar invocations.
+/// workspace path through `etc-link -> /etc` clears the lexical check but
+/// would still leak `/etc/passwd` once `tar -C` follows the link. Resolving
+/// symlinks on the remote side and re-validating closes that gap. The returned
+/// fully-resolved path is what the caller should hand to probe and tar
+/// invocations.
 async fn resolve_sandbox_source_path(
     session: &SshSessionConfig,
     sandbox_path: &str,
+    workspace_root: &str,
 ) -> Result<String> {
     let resolve_cmd = format!("realpath -e -- {path}", path = shell_escape(sandbox_path));
     let resolved = ssh_run_capture_stdout(session, &resolve_cmd)
@@ -935,9 +926,9 @@ async fn resolve_sandbox_source_path(
             "sandbox source path '{sandbox_path}' does not exist"
         ));
     }
-    if !is_under_sandbox_workspace(&resolved) {
+    if !is_under_workspace(&resolved, workspace_root) {
         return Err(miette::miette!(
-            "sandbox source path '{sandbox_path}' resolves to '{resolved}', outside the sandbox workspace ({SANDBOX_WORKSPACE_ROOT})"
+            "sandbox source path '{sandbox_path}' resolves to '{resolved}', outside the sandbox workspace ({workspace_root})"
         ));
     }
     Ok(resolved)
@@ -971,7 +962,7 @@ fn resolve_file_download_target(
 ///
 /// Files are streamed as a tar archive to `ssh ... tar xf - -C <dest>` on
 /// the sandbox side.  When `dest` is `None`, files are uploaded to the
-/// sandbox user's home directory.
+/// discovered sandbox working directory.
 #[allow(clippy::too_many_arguments)]
 pub async fn sandbox_sync_up_files(
     server: &str,
@@ -1003,11 +994,11 @@ pub async fn sandbox_sync_up_files(
 
 /// Push a local path (file or directory) into a sandbox using tar-over-SSH.
 ///
-/// When `sandbox_path` is `None`, files are uploaded to the sandbox user's
-/// home directory.  When uploading a single file to an explicit destination
-/// that does not end with `/`, the destination is treated as a file path:
-/// the parent directory is created and the file is written with the
-/// destination's basename.  This matches `cp` / `scp` semantics.
+/// When `sandbox_path` is `None`, files are uploaded to the discovered sandbox
+/// working directory. When uploading a single file to an explicit destination
+/// that does not end with `/`, the destination is treated as a file path: the
+/// parent directory is created and the file is written with the destination's
+/// basename. This matches `cp` / `scp` semantics.
 pub async fn sandbox_sync_up(
     server: &str,
     name: &str,
@@ -1021,10 +1012,10 @@ pub async fn sandbox_sync_up(
     // `mkdir -p` creates the parent and tar extracts the file with the right
     // name.
     //
-    // Exception: if splitting would yield "/" as the parent (e.g. the user
-    // passed "/sandbox"), fall through to directory semantics instead.  The
-    // sandbox user cannot write to "/" and the intent is almost certainly
-    // "put the file inside /sandbox", not "create a file named sandbox in /".
+    // Exception: if splitting would yield "/" as the parent, fall through to
+    // directory semantics instead. The sandbox user cannot write to "/" and
+    // the intent is almost certainly to place the file inside the named
+    // top-level directory.
     let local_path_is_file_like = local_upload_path_is_file_like(local_path);
     if let Some(path) = sandbox_path
         && local_path_is_file_like
@@ -1127,6 +1118,29 @@ async fn ssh_run_capture_stdout(session: &SshSessionConfig, command: &str) -> Re
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+fn validate_discovered_workspace_root(root: &str) -> Result<String> {
+    let cleaned = lexical_clean_absolute_path(root)
+        .ok_or_else(|| miette::miette!("remote workspace must be an absolute path"))?;
+    if cleaned == "/" {
+        return Err(miette::miette!(
+            "remote workspace resolved to the container root"
+        ));
+    }
+    if cleaned != root {
+        return Err(miette::miette!(
+            "remote workspace '{root}' is not a canonical absolute path"
+        ));
+    }
+    Ok(cleaned)
+}
+
+async fn discover_workspace_root(session: &SshSessionConfig) -> Result<String> {
+    let root = ssh_run_capture_stdout(session, "pwd -P")
+        .await
+        .wrap_err("failed to discover remote workspace")?;
+    validate_discovered_workspace_root(&root)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SandboxSourceKind {
     File,
@@ -1170,7 +1184,7 @@ async fn probe_sandbox_source_kind(
 ///
 /// The sandbox source path is also subjected to a workspace-boundary check
 /// before any SSH command is issued; paths that lexically resolve outside
-/// `/sandbox` are refused.
+/// the discovered workspace root are refused.
 pub async fn sandbox_sync_down(
     server: &str,
     name: &str,
@@ -1179,9 +1193,11 @@ pub async fn sandbox_sync_down(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<()> {
-    let sandbox_path = validate_sandbox_source_path(sandbox_path)?;
     let session = ssh_session_config(server, name, tls, workspace).await?;
-    let sandbox_path = resolve_sandbox_source_path(&session, &sandbox_path).await?;
+    let workspace_root = discover_workspace_root(&session).await?;
+    let sandbox_path = validate_sandbox_source_path(sandbox_path, &workspace_root)?;
+    let sandbox_path =
+        resolve_sandbox_source_path(&session, &sandbox_path, &workspace_root).await?;
     let kind = probe_sandbox_source_kind(&session, &sandbox_path).await?;
 
     match kind {
@@ -1631,19 +1647,25 @@ pub fn install_ssh_config(gateway: &str, name: &str, workspace: &str) -> Result<
     Ok(managed_config)
 }
 
-fn launch_editor(editor: Editor, host_alias: &str) -> Result<()> {
+fn launch_editor(editor: Editor, host_alias: &str, workspace_root: &str) -> Result<()> {
     launch_editor_command(
         editor.binary(),
         editor.label(),
         &Editor::remote_target(host_alias),
+        workspace_root,
     )
 }
 
-fn launch_editor_command(binary: &str, label: &str, remote_target: &str) -> Result<()> {
+fn launch_editor_command(
+    binary: &str,
+    label: &str,
+    remote_target: &str,
+    workspace_root: &str,
+) -> Result<()> {
     let status = Command::new(binary)
         .arg("--remote")
         .arg(remote_target)
-        .arg("/sandbox")
+        .arg(workspace_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1776,6 +1798,7 @@ mod tests {
             "openshell-test-missing-binary",
             "Test Editor",
             "ssh-remote+openshell-demo",
+            "/workspace/project",
         )
         .unwrap_err();
         let text = format!("{err}");
@@ -1968,68 +1991,105 @@ mod tests {
 
     #[test]
     fn validate_sandbox_source_path_accepts_workspace_paths() {
+        let workspace_root = "/workspace/project";
         assert_eq!(
-            validate_sandbox_source_path("/sandbox/file.txt").unwrap(),
-            "/sandbox/file.txt"
+            validate_sandbox_source_path("/workspace/project/file.txt", workspace_root).unwrap(),
+            "/workspace/project/file.txt"
         );
         assert_eq!(
-            validate_sandbox_source_path("/sandbox/.agent/workspace/hello.txt").unwrap(),
-            "/sandbox/.agent/workspace/hello.txt"
+            validate_sandbox_source_path(
+                "/workspace/project/.agent/workspace/hello.txt",
+                workspace_root
+            )
+            .unwrap(),
+            "/workspace/project/.agent/workspace/hello.txt"
         );
         assert_eq!(
-            validate_sandbox_source_path("/sandbox").unwrap(),
-            "/sandbox"
+            validate_sandbox_source_path("/workspace/project", workspace_root).unwrap(),
+            "/workspace/project"
         );
         assert_eq!(
-            validate_sandbox_source_path("/sandbox/").unwrap(),
-            "/sandbox"
+            validate_sandbox_source_path("/workspace/project/", workspace_root).unwrap(),
+            "/workspace/project"
         );
         assert_eq!(
-            validate_sandbox_source_path("/sandbox/sub/../file").unwrap(),
-            "/sandbox/file"
+            validate_sandbox_source_path("/workspace/project/sub/../file", workspace_root).unwrap(),
+            "/workspace/project/file"
         );
     }
 
     #[test]
     fn validate_sandbox_source_path_rejects_traversal_and_escapes() {
-        let traversal = validate_sandbox_source_path("/etc/passwd").unwrap_err();
+        let workspace_root = "/workspace/project";
+        let traversal = validate_sandbox_source_path("/etc/passwd", workspace_root).unwrap_err();
         assert!(
             format!("{traversal}").contains("outside the sandbox workspace"),
             "unexpected error: {traversal}"
         );
 
-        let parent_escape = validate_sandbox_source_path("/sandbox/../etc/passwd").unwrap_err();
+        let parent_escape =
+            validate_sandbox_source_path("/workspace/project/../../etc/passwd", workspace_root)
+                .unwrap_err();
         assert!(
             format!("{parent_escape}").contains("outside the sandbox workspace"),
             "unexpected error: {parent_escape}"
         );
 
-        let prefix_only = validate_sandbox_source_path("/sandboxed/secrets").unwrap_err();
+        let prefix_only =
+            validate_sandbox_source_path("/workspace/projected/secrets", workspace_root)
+                .unwrap_err();
         assert!(
             format!("{prefix_only}").contains("outside the sandbox workspace"),
             "unexpected error: {prefix_only}"
         );
 
-        let empty = validate_sandbox_source_path("").unwrap_err();
+        let empty = validate_sandbox_source_path("", workspace_root).unwrap_err();
         assert!(format!("{empty}").contains("empty"));
 
-        let relative = validate_sandbox_source_path("sandbox/file").unwrap_err();
+        let relative =
+            validate_sandbox_source_path("workspace/project/file", workspace_root).unwrap_err();
         assert!(format!("{relative}").contains("must be absolute"));
     }
 
     #[test]
-    fn is_under_sandbox_workspace_accepts_root_and_descendants() {
-        assert!(is_under_sandbox_workspace("/sandbox"));
-        assert!(is_under_sandbox_workspace("/sandbox/file"));
-        assert!(is_under_sandbox_workspace("/sandbox/sub/nested"));
+    fn is_under_workspace_accepts_root_and_descendants() {
+        assert!(is_under_workspace(
+            "/workspace/project",
+            "/workspace/project"
+        ));
+        assert!(is_under_workspace(
+            "/workspace/project/file",
+            "/workspace/project"
+        ));
+        assert!(is_under_workspace(
+            "/workspace/project/sub/nested",
+            "/workspace/project"
+        ));
     }
 
     #[test]
-    fn is_under_sandbox_workspace_rejects_outside_paths_and_prefix_collisions() {
-        assert!(!is_under_sandbox_workspace("/etc/passwd"));
-        assert!(!is_under_sandbox_workspace("/sandboxed/secrets"));
-        assert!(!is_under_sandbox_workspace("/"));
-        assert!(!is_under_sandbox_workspace(""));
+    fn is_under_workspace_rejects_outside_paths_and_prefix_collisions() {
+        assert!(!is_under_workspace("/etc/passwd", "/workspace/project"));
+        assert!(!is_under_workspace(
+            "/workspace/projected/secrets",
+            "/workspace/project"
+        ));
+        assert!(!is_under_workspace("/", "/workspace/project"));
+        assert!(!is_under_workspace("", "/workspace/project"));
+    }
+
+    #[test]
+    fn discovered_workspace_root_must_be_canonical_absolute_non_root() {
+        assert_eq!(
+            validate_discovered_workspace_root("/workspace/project").unwrap(),
+            "/workspace/project"
+        );
+        for invalid in ["", "workspace", "/", "/workspace/../etc", "/workspace/"] {
+            assert!(
+                validate_discovered_workspace_root(invalid).is_err(),
+                "expected '{invalid}' to be rejected"
+            );
+        }
     }
 
     #[test]

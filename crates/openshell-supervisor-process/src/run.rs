@@ -54,6 +54,7 @@ pub async fn run_process(
     program: &str,
     args: &[String],
     workdir: Option<&str>,
+    workspace_home: bool,
     timeout_secs: u64,
     interactive: bool,
     sandbox_id: Option<&str>,
@@ -95,7 +96,12 @@ pub async fn run_process(
     // is forked so the workload sees writable paths it owns.
     #[cfg(unix)]
     if enforcement_mode.uses_privileged_process_setup() {
-        crate::process::prepare_filesystem_with_identity(policy, resolved_process_identity)?;
+        crate::process::prepare_filesystem_with_identity(
+            policy,
+            resolved_process_identity,
+            workdir,
+            workspace_home,
+        )?;
     }
 
     // Eagerly fetch initial settings and install the agent skill if the
@@ -244,6 +250,7 @@ pub async fn run_process(
                 ssh_ready_tx,
                 policy_clone,
                 workdir_clone,
+                workspace_home,
                 netns_fd,
                 proxy_url,
                 ca_paths,
@@ -320,6 +327,7 @@ pub async fn run_process(
         program,
         args,
         workdir,
+        workspace_home,
         interactive,
         policy,
         resolved_process_identity,
@@ -334,6 +342,7 @@ pub async fn run_process(
         program,
         args,
         workdir,
+        workspace_home,
         interactive,
         policy,
         resolved_process_identity,

@@ -571,6 +571,7 @@ fn container_creation_uses_inspected_immutable_image() {
     let metadata = DockerImageMetadata {
         id: "sha256:immutable".to_string(),
         user: "1234:1235".to_string(),
+        working_dir: "/workspace/project".to_string(),
     };
     let body = build_container_create_body_for_image(
         &sandbox,
@@ -583,10 +584,72 @@ fn container_creation_uses_inspected_immutable_image() {
 
     assert_eq!(body.image.as_deref(), Some("sha256:immutable"));
     assert_eq!(body.user.as_deref(), Some("0"));
+    assert_eq!(
+        body.cmd.as_deref(),
+        Some(&["--workdir".to_string(), "/workspace/project".to_string()][..])
+    );
     assert!(body.env.unwrap().contains(&format!(
         "{}=1234:1235",
         openshell_core::sandbox_env::OCI_IMAGE_USER
     )));
+}
+
+#[test]
+fn container_creation_rejects_invalid_oci_working_dir() {
+    let metadata = DockerImageMetadata {
+        id: "sha256:immutable".to_string(),
+        user: "1234:1235".to_string(),
+        working_dir: "relative/workspace".to_string(),
+    };
+    let err = build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &DockerSandboxDriverConfig::default(),
+        None,
+        &metadata,
+    )
+    .unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("must be an absolute container path"));
+}
+
+#[test]
+fn container_creation_reserves_resolved_workspace_root_but_allows_nested_mounts() {
+    let metadata = DockerImageMetadata {
+        id: "sha256:immutable".to_string(),
+        user: "1234:1235".to_string(),
+        working_dir: "/workspace".to_string(),
+    };
+    let root_mount: DockerSandboxDriverConfig = serde_json::from_value(serde_json::json!({
+        "mounts": [{"type": "tmpfs", "target": "/workspace"}]
+    }))
+    .unwrap();
+    let err = build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &root_mount,
+        None,
+        &metadata,
+    )
+    .unwrap_err();
+    assert!(
+        err.message()
+            .contains("reserved for the OpenShell workspace")
+    );
+
+    let nested_mount: DockerSandboxDriverConfig = serde_json::from_value(serde_json::json!({
+        "mounts": [{"type": "tmpfs", "target": "/workspace/cache"}]
+    }))
+    .unwrap();
+    build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &nested_mount,
+        None,
+        &metadata,
+    )
+    .expect("nested workspace mounts remain supported");
 }
 
 #[test]
@@ -1219,14 +1282,17 @@ fn managed_container_label_filters_include_gateway_namespace() {
 }
 
 #[test]
-fn build_container_create_body_clears_inherited_cmd() {
+fn build_container_create_body_replaces_inherited_cmd_with_workspace_arg() {
     let create_body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
 
     assert_eq!(
         create_body.entrypoint,
         Some(vec![SUPERVISOR_MOUNT_PATH.to_string()])
     );
-    assert_eq!(create_body.cmd, Some(Vec::new()));
+    assert_eq!(
+        create_body.cmd,
+        Some(vec!["--workdir".to_string(), "/sandbox".to_string()])
+    );
     assert_eq!(
         create_body
             .labels

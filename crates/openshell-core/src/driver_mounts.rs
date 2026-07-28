@@ -32,6 +32,10 @@ const RESERVED_MOUNT_TARGETS: &[&str] = &[
     "/run/netns",
 ];
 
+/// Compatibility workspace used when an OCI image has no usable working
+/// directory and by drivers whose workspace remains fixed.
+pub const DEFAULT_WORKSPACE_ROOT: &str = "/sandbox";
+
 /// Validate a non-empty driver mount source.
 pub fn validate_mount_source(source: &str, field: &str) -> Result<(), String> {
     if source.is_empty() {
@@ -114,15 +118,57 @@ pub fn validate_container_mount_target(target: &str) -> Result<(), String> {
     {
         return Err("mount target must not contain '..'".to_string());
     }
-    if path == Path::new("/sandbox") {
-        return Err("mount target '/sandbox' is reserved for the OpenShell workspace".to_string());
-    }
     for reserved in RESERVED_MOUNT_TARGETS {
         if path_is_or_under(path, Path::new(reserved)) {
             return Err(format!(
                 "mount target '{target}' conflicts with reserved OpenShell path '{reserved}'"
             ));
         }
+    }
+    Ok(())
+}
+
+/// Resolve an OCI image working directory to the internal workspace root used
+/// by local container drivers.
+///
+/// Empty declarations and `/` use the compatibility fallback. Non-empty
+/// declarations must already be normalized absolute paths so the inspected
+/// value and the path passed to the supervisor cannot be interpreted
+/// differently.
+pub fn resolve_oci_workspace_root(working_dir: &str) -> Result<String, String> {
+    if working_dir.is_empty() || working_dir == "/" {
+        return Ok(DEFAULT_WORKSPACE_ROOT.to_string());
+    }
+    if working_dir.as_bytes().contains(&0) {
+        return Err("OCI WorkingDir must not contain NUL bytes".to_string());
+    }
+    if !working_dir.starts_with('/') {
+        return Err(format!(
+            "OCI WorkingDir '{working_dir}' must be an absolute container path"
+        ));
+    }
+
+    let segments = working_dir.split('/').skip(1).collect::<Vec<_>>();
+    let has_internal_empty_segment = segments
+        .iter()
+        .take(segments.len().saturating_sub(1))
+        .any(|segment| segment.is_empty());
+    if has_internal_empty_segment || segments.contains(&".") || segments.contains(&"..") {
+        return Err(format!(
+            "OCI WorkingDir '{working_dir}' must be normalized without empty, '.', or '..' path segments"
+        ));
+    }
+
+    Ok(working_dir.trim_end_matches('/').to_string())
+}
+
+/// Reject a user-supplied mount that would replace the resolved workspace
+/// root. Mounts below the workspace remain valid.
+pub fn validate_workspace_mount_target(target: &str, workspace_root: &str) -> Result<(), String> {
+    if normalize_mount_target(target) == workspace_root {
+        return Err(format!(
+            "mount target '{target}' is reserved for the OpenShell workspace"
+        ));
     }
     Ok(())
 }
@@ -151,10 +197,42 @@ mod tests {
     }
 
     #[test]
-    fn container_target_rejects_workspace_root_only() {
-        let err = validate_container_mount_target("/sandbox/").unwrap_err();
+    fn container_target_workspace_reservation_is_dynamic() {
+        validate_container_mount_target("/sandbox/").unwrap();
+        validate_workspace_mount_target("/sandbox/", "/sandbox").unwrap_err();
+        validate_workspace_mount_target("/workspace/", "/sandbox").unwrap();
+        validate_workspace_mount_target("/workspace/cache", "/workspace").unwrap();
+    }
 
-        assert!(err.contains("reserved for the OpenShell workspace"));
+    #[test]
+    fn oci_workspace_root_uses_fallback_and_accepts_normalized_absolute_paths() {
+        assert_eq!(resolve_oci_workspace_root("").unwrap(), "/sandbox");
+        assert_eq!(resolve_oci_workspace_root("/").unwrap(), "/sandbox");
+        assert_eq!(
+            resolve_oci_workspace_root("/workspace/project/").unwrap(),
+            "/workspace/project"
+        );
+        assert_eq!(
+            resolve_oci_workspace_root("/workspace with spaces").unwrap(),
+            "/workspace with spaces"
+        );
+    }
+
+    #[test]
+    fn oci_workspace_root_rejects_relative_and_malformed_paths() {
+        for invalid in [
+            "workspace",
+            "./workspace",
+            "/workspace/../etc",
+            "/workspace/./project",
+            "/workspace//project",
+            "/workspace\0project",
+        ] {
+            assert!(
+                resolve_oci_workspace_root(invalid).is_err(),
+                "expected '{invalid}' to be rejected"
+            );
+        }
     }
 
     #[test]

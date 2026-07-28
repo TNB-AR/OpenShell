@@ -231,6 +231,7 @@ struct DockerProvisioningFailure {
 struct DockerImageMetadata {
     id: String,
     user: String,
+    working_dir: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1348,11 +1349,20 @@ impl DockerComputeDriver {
                 "docker image '{image}' inspection did not return an immutable image ID"
             ))
         })?;
-        let user = inspect
-            .config
-            .and_then(|config| config.user)
-            .unwrap_or_default();
-        Ok(DockerImageMetadata { id, user })
+        let (user, working_dir) = inspect.config.map_or_else(
+            || (String::new(), String::new()),
+            |config| {
+                (
+                    config.user.unwrap_or_default(),
+                    config.working_dir.unwrap_or_default(),
+                )
+            },
+        );
+        Ok(DockerImageMetadata {
+            id,
+            user,
+            working_dir,
+        })
     }
 
     async fn pull_image(&self, sandbox_id: &str, image: &str) -> Result<(), Status> {
@@ -2361,6 +2371,7 @@ fn build_container_create_body_with_gpu_devices(
         &DockerImageMetadata {
             id: template.image.clone(),
             user: String::new(),
+            working_dir: String::new(),
         },
     )
 }
@@ -2381,6 +2392,18 @@ fn build_container_create_body_for_image(
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
     let resource_limits = docker_resource_limits(template)?;
+    let workspace_root = driver_mounts::resolve_oci_workspace_root(&image.working_dir)
+        .map_err(Status::failed_precondition)?;
+    for mount in &driver_config.mounts {
+        let target = match mount {
+            DockerDriverMountConfig::Bind { target, .. }
+            | DockerDriverMountConfig::Volume { target, .. }
+            | DockerDriverMountConfig::Tmpfs { target, .. }
+            | DockerDriverMountConfig::Image { target, .. } => target,
+        };
+        driver_mounts::validate_workspace_mount_target(target, &workspace_root)
+            .map_err(Status::failed_precondition)?;
+    }
     let user_mounts = docker_driver_mounts(driver_config)?;
     let user_bind_strings = docker_driver_bind_strings(driver_config)?;
     let device_requests = gpu_device_ids.map(|device_ids| {
@@ -2417,7 +2440,7 @@ fn build_container_create_body_for_image(
         entrypoint: Some(vec![SUPERVISOR_MOUNT_PATH.to_string()]),
         // Clear the image CMD so Docker does not append inherited args to the
         // supervisor entrypoint.
-        cmd: Some(Vec::new()),
+        cmd: Some(vec!["--workdir".to_string(), workspace_root]),
         labels: Some(labels),
         host_config: Some(HostConfig {
             nano_cpus: resource_limits.nano_cpus,

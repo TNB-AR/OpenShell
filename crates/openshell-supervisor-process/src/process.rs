@@ -528,6 +528,7 @@ impl ProcessHandle {
         program: &str,
         args: &[String],
         workdir: Option<&str>,
+        workspace_home: bool,
         interactive: bool,
         policy: &SandboxPolicy,
         resolved_identity: ResolvedProcessIdentity,
@@ -540,6 +541,7 @@ impl ProcessHandle {
             program,
             args,
             workdir,
+            workspace_home,
             interactive,
             policy,
             resolved_identity,
@@ -561,6 +563,7 @@ impl ProcessHandle {
         program: &str,
         args: &[String],
         workdir: Option<&str>,
+        workspace_home: bool,
         interactive: bool,
         policy: &SandboxPolicy,
         resolved_identity: ResolvedProcessIdentity,
@@ -572,6 +575,7 @@ impl ProcessHandle {
             program,
             args,
             workdir,
+            workspace_home,
             interactive,
             policy,
             resolved_identity,
@@ -587,6 +591,7 @@ impl ProcessHandle {
         program: &str,
         args: &[String],
         workdir: Option<&str>,
+        workspace_home: bool,
         interactive: bool,
         policy: &SandboxPolicy,
         resolved_identity: ResolvedProcessIdentity,
@@ -613,6 +618,9 @@ impl ProcessHandle {
 
         if let Some(dir) = workdir {
             cmd.current_dir(dir);
+            if workspace_home {
+                cmd.env("HOME", dir);
+            }
         }
 
         if matches!(policy.network.mode, NetworkMode::Proxy) {
@@ -742,6 +750,7 @@ impl ProcessHandle {
         program: &str,
         args: &[String],
         workdir: Option<&str>,
+        workspace_home: bool,
         interactive: bool,
         policy: &SandboxPolicy,
         resolved_identity: ResolvedProcessIdentity,
@@ -765,6 +774,9 @@ impl ProcessHandle {
 
         if let Some(dir) = workdir {
             cmd.current_dir(dir);
+            if workspace_home {
+                cmd.env("HOME", dir);
+            }
         }
 
         if matches!(policy.network.mode, NetworkMode::Proxy) {
@@ -1253,6 +1265,68 @@ fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result
 }
 
 #[cfg(unix)]
+fn prepare_oci_workspace(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<()> {
+    prepare_oci_workspace_with(root, uid, gid, &nix::unistd::chown)
+}
+
+/// Prepare only the resolved `OpenShell` workspace directory itself.
+///
+/// Image-provided children retain their declared ownership. This avoids
+/// crossing symlinks or user-provided nested mounts.
+#[cfg(unix)]
+fn prepare_oci_workspace_with(
+    root: &Path,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+    do_chown: &impl Fn(&Path, Option<Uid>, Option<Gid>) -> nix::Result<()>,
+) -> Result<()> {
+    if !root.is_absolute() || root == Path::new("/") {
+        return Err(miette::miette!(
+            "workspace path '{}' must be an absolute non-root path",
+            root.display()
+        ));
+    }
+
+    let components = root
+        .components()
+        .skip(1)
+        .map(|component| match component {
+            std::path::Component::Normal(component) => Ok(component),
+            _ => Err(miette::miette!(
+                "workspace path '{}' must be normalized",
+                root.display()
+            )),
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut current = PathBuf::from("/");
+    for component in components {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(miette::miette!(
+                    "workspace path component '{}' is a symlink — refusing to follow it",
+                    current.display()
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(miette::miette!(
+                    "workspace path component '{}' is not a directory",
+                    current.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current).into_diagnostic()?;
+            }
+            Err(error) => return Err(error).into_diagnostic(),
+        }
+    }
+
+    do_chown(root, uid, gid).into_diagnostic()
+}
+
+#[cfg(unix)]
 fn chown_children(
     dir: &Path,
     uid: Option<Uid>,
@@ -1315,13 +1389,15 @@ fn chown_recursive(
 /// UIDs/GIDs (passed directly to `chown` without a passwd lookup).
 #[cfg(unix)]
 pub fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
-    prepare_filesystem_with_identity(policy, ResolvedProcessIdentity::default())
+    prepare_filesystem_with_identity(policy, ResolvedProcessIdentity::default(), None, false)
 }
 
 #[cfg(unix)]
 pub fn prepare_filesystem_with_identity(
     policy: &SandboxPolicy,
     resolved_identity: ResolvedProcessIdentity,
+    workdir: Option<&str>,
+    prepare_workspace: bool,
 ) -> Result<()> {
     use nix::unistd::chown;
     use nix::unistd::{Gid, Uid};
@@ -1363,6 +1439,20 @@ pub fn prepare_filesystem_with_identity(
             _ => None,
         },
     };
+
+    // Docker and Podman own workspace resolution and must make the selected
+    // root usable by the final effective identity, including when both policy
+    // identity fields were explicit. Validate it before processing any
+    // user-authored read-write paths so an unsafe image path fails first.
+    // Other drivers retain their preparation.
+    if prepare_workspace {
+        let workspace = workdir.ok_or_else(|| {
+            miette::miette!("local container driver did not supply a workspace workdir")
+        })?;
+        let workspace = Path::new(workspace);
+        info!(path = %workspace.display(), ?uid, ?gid, "Preparing resolved workspace");
+        prepare_oci_workspace(workspace, uid, gid)?;
+    }
 
     // Create missing read_write paths and only chown the ones we created.
     for path in &policy.filesystem.read_write {
@@ -2435,6 +2525,179 @@ mod tests {
             &fake_chown,
         );
         assert!(result.is_err(), "non-EROFS errors should propagate");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_oci_workspace_chowns_only_root() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("sandbox");
+        std::fs::create_dir(&root).unwrap();
+        let child = root.join("image-content.txt");
+        std::fs::write(&child, "image-owned").unwrap();
+
+        let chowned = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&chowned);
+        let fake_chown =
+            move |path: &Path, _uid: Option<Uid>, _gid: Option<Gid>| -> nix::Result<()> {
+                observed.lock().unwrap().push(path.to_path_buf());
+                Ok(())
+            };
+
+        prepare_oci_workspace_with(
+            &root,
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+            &fake_chown,
+        )
+        .expect("workspace root should be prepared");
+
+        assert_eq!(*chowned.lock().unwrap(), vec![root]);
+        assert!(child.exists(), "image-provided child should be untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_oci_workspace_rejects_symlink_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let target = base.join("real");
+        let link = base.join("link");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let err = prepare_oci_workspace(
+            &link,
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_oci_workspace_rejects_symlink_parent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let target = base.join("real");
+        let parent_link = base.join("parent-link");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &parent_link).unwrap();
+
+        let err = prepare_oci_workspace(
+            &parent_link.join("workspace"),
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected parent symlink rejection: {err}"
+        );
+        assert!(
+            !target.join("workspace").exists(),
+            "workspace must not be created through a symlink parent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_oci_workspace_rejects_parent_traversal() {
+        let err = prepare_oci_workspace(
+            Path::new("/tmp/workspace/../escape"),
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("must be normalized"),
+            "expected traversal rejection: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_oci_workspace_rejects_non_directory_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("sandbox");
+        std::fs::write(&root, "not a directory").unwrap();
+
+        let error = prepare_oci_workspace(
+            &root,
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("is not a directory"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_oci_workspace_propagates_root_chown_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("sandbox");
+        std::fs::create_dir(&root).unwrap();
+        let fake_chown = |_path: &Path, _uid: Option<Uid>, _gid: Option<Gid>| -> nix::Result<()> {
+            Err(nix::errno::Errno::EROFS)
+        };
+
+        let error = prepare_oci_workspace_with(
+            &root,
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+            &fake_chown,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("Read-only file system"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_oci_workspace_creates_missing_root() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("missing")
+            .join("sandbox");
+        let chowned = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&chowned);
+        let fake_chown =
+            move |path: &Path, _uid: Option<Uid>, _gid: Option<Gid>| -> nix::Result<()> {
+                observed.lock().unwrap().push(path.to_path_buf());
+                Ok(())
+            };
+
+        prepare_oci_workspace_with(
+            &missing,
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+            &fake_chown,
+        )
+        .expect("missing OCI workspace should be created");
+
+        assert!(missing.is_dir());
+        assert_eq!(*chowned.lock().unwrap(), vec![missing]);
     }
 
     #[cfg(unix)]

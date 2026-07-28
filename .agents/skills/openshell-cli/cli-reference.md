@@ -258,11 +258,11 @@ Open an interactive SSH shell. The name defaults to the last-used sandbox. `--ed
 
 ### `openshell sandbox upload <name> <path> [dest]`
 
-Upload files using tar-over-SSH. The destination defaults to the container working directory. `.gitignore` filtering is enabled unless `--no-git-ignore` is passed.
+Upload files using tar-over-SSH. The CLI discovers the canonical remote working directory when the destination is omitted. `.gitignore` filtering is enabled unless `--no-git-ignore` is passed.
 
 ### `openshell sandbox download <name> <path> [dest]`
 
-Download files using tar-over-SSH. The local destination defaults to `.`.
+Download files using tar-over-SSH. The sandbox source must be an absolute path within the canonical remote working directory. The local destination defaults to `.`.
 
 ### `openshell sandbox ssh-config [name]`
 

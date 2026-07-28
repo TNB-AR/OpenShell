@@ -433,6 +433,14 @@ declared name or numeric components for both direct and SSH children. When
 `USER` omits the group, the supervisor uses the user's numeric primary GID. It
 does not modify `/etc/passwd` or `/etc/group`.
 
+Docker and Podman also inspect OCI `WorkingDir`. An absolute value becomes the
+agent workspace; an empty or root (`/`) value falls back to `/sandbox`.
+OpenShell creates the resolved directory when needed and transfers ownership of
+only that directory to the completed UID/GID. Existing image contents and
+nested bind or volume mounts retain their ownership. The resolved workspace is
+the cwd and `HOME` for direct and SSH children. Sandbox startup fails before
+readiness when the declaration is invalid or the workspace cannot be prepared.
+
 Sandbox creation fails before readiness if a required `USER` component is
 missing, malformed, unknown, ambiguous, or resolves to UID/GID 0. An image
 without `USER` therefore works only when policy explicitly provides both
@@ -462,7 +470,6 @@ The VM driver injects the sandbox UID into the rootfs guest's `/etc/passwd`, `/e
 Docker and Podman custom images do not need a baked-in `"sandbox"` user. Declare
 a non-root OCI `USER`, or set both process identity fields explicitly in policy.
 Named image users require matching account entries; a numeric `UID:GID` pair
-does not. OpenShell continues to use `/sandbox` as the workspace; it does not
-adopt the image's OCI working directory. Until OCI working-directory support is
-added, custom images must create `/sandbox` and make it writable by the selected
-identity.
+does not. Declare an absolute OCI `WORKDIR` to select the workspace. Images with
+no working directory, or `WORKDIR /`, use OpenShell's `/sandbox` fallback.
+Kubernetes/OpenShift and VM sandboxes continue to use `/sandbox`.

@@ -112,6 +112,7 @@ pub async fn run_ssh_server(
     ready_tx: tokio::sync::oneshot::Sender<Result<()>>,
     policy: SandboxPolicy,
     workdir: Option<String>,
+    workspace_home: bool,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
     ca_file_paths: Option<(PathBuf, PathBuf)>,
@@ -157,6 +158,7 @@ pub async fn run_ssh_server(
                 config,
                 policy,
                 workdir,
+                workspace_home,
                 netns_fd,
                 proxy_url,
                 ca_paths,
@@ -186,6 +188,7 @@ async fn handle_connection(
     config: Arc<russh::server::Config>,
     policy: SandboxPolicy,
     workdir: Option<String>,
+    workspace_home: bool,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
@@ -211,6 +214,7 @@ async fn handle_connection(
     let handler = SshHandler::new(
         policy,
         workdir,
+        workspace_home,
         netns_fd,
         proxy_url,
         ca_file_paths,
@@ -241,6 +245,7 @@ struct ChannelState {
 struct SshHandler {
     policy: SandboxPolicy,
     workdir: Option<String>,
+    workspace_home: bool,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
@@ -256,6 +261,7 @@ impl SshHandler {
     fn new(
         policy: SandboxPolicy,
         workdir: Option<String>,
+        workspace_home: bool,
         netns_fd: Option<RawFd>,
         proxy_url: Option<String>,
         ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
@@ -267,6 +273,7 @@ impl SshHandler {
         Self {
             policy,
             workdir,
+            workspace_home,
             netns_fd,
             proxy_url,
             ca_file_paths,
@@ -489,6 +496,7 @@ impl russh::server::Handler for SshHandler {
             let input_sender = spawn_pipe_exec(
                 &self.policy,
                 self.workdir.clone(),
+                self.workspace_home,
                 Some("/usr/lib/openssh/sftp-server".to_string()),
                 session.handle(),
                 channel,
@@ -586,6 +594,7 @@ impl SshHandler {
             let (pty_master, input_sender) = spawn_pty_shell(
                 &self.policy,
                 self.workdir.clone(),
+                self.workspace_home,
                 command,
                 &pty,
                 handle,
@@ -607,6 +616,7 @@ impl SshHandler {
             let input_sender = spawn_pipe_exec(
                 &self.policy,
                 self.workdir.clone(),
+                self.workspace_home,
                 command,
                 handle,
                 channel,
@@ -699,28 +709,31 @@ impl Default for PtyRequest {
 /// For name-based identities, looks up the home directory via `/etc/passwd`
 /// (or defaults to `/home/{user}`).
 ///
-/// For numeric UIDs, there is no passwd entry — falls back to
-/// `("{uid}", "/sandbox")` so the agent session still has a meaningful
-/// USER identifier.
-fn session_user_and_home(policy: &SandboxPolicy) -> (String, String) {
-    match policy.process.run_as_user.as_deref() {
+/// For numeric UIDs, there is no passwd entry, so the default remains
+/// `("{uid}", "/sandbox")`. Docker and Podman replace that default with their
+/// resolved image workspace.
+fn session_user_and_home(policy: &SandboxPolicy, workspace_home: Option<&str>) -> (String, String) {
+    let (user, default_home) = match policy.process.run_as_user.as_deref() {
         Some(user) if !user.is_empty() => {
             // Numeric UID — no passwd entry expected; use default HOME.
             if user.parse::<u32>().is_ok() {
-                return (user.to_string(), "/sandbox".to_string());
+                (user.to_string(), "/sandbox".to_string())
+            } else {
+                // Name-based identity — look up home from /etc/passwd.
+                let home = nix::unistd::User::from_name(user)
+                    .ok()
+                    .flatten()
+                    .map_or_else(
+                        || format!("/home/{user}"),
+                        |u| u.dir.to_string_lossy().into_owned(),
+                    );
+                (user.to_string(), home)
             }
-            // Name-based identity — look up home from /etc/passwd.
-            let home = nix::unistd::User::from_name(user)
-                .ok()
-                .flatten()
-                .map_or_else(
-                    || format!("/home/{user}"),
-                    |u| u.dir.to_string_lossy().into_owned(),
-                );
-            (user.to_string(), home)
         }
         _ => ("sandbox".to_string(), "/sandbox".to_string()),
-    }
+    };
+    let home = workspace_home.map_or(default_home, str::to_string);
+    (user, home)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -774,6 +787,7 @@ fn apply_child_env(
 fn spawn_pty_shell(
     policy: &SandboxPolicy,
     workdir: Option<String>,
+    workspace_home: bool,
     command: Option<String>,
     pty: &PtyRequest,
     handle: Handle,
@@ -824,7 +838,14 @@ fn spawn_pty_shell(
 
     // Derive USER and HOME from the policy's run_as_user when available,
     // falling back to "sandbox" / "/sandbox" for backward compatibility.
-    let (session_user, session_home) = session_user_and_home(policy);
+    let (session_user, session_home) = session_user_and_home(
+        policy,
+        if workspace_home {
+            workdir.as_deref()
+        } else {
+            None
+        },
+    );
     apply_child_env(
         &mut cmd,
         &session_home,
@@ -947,6 +968,7 @@ fn spawn_pty_shell(
 fn spawn_pipe_exec(
     policy: &SandboxPolicy,
     workdir: Option<String>,
+    workspace_home: bool,
     command: Option<String>,
     handle: Handle,
     channel: ChannelId,
@@ -978,7 +1000,14 @@ fn spawn_pipe_exec(
         },
     );
 
-    let (session_user, session_home) = session_user_and_home(policy);
+    let (session_user, session_home) = session_user_and_home(
+        policy,
+        if workspace_home {
+            workdir.as_deref()
+        } else {
+            None
+        },
+    );
     apply_child_env(
         &mut cmd,
         &session_home,
@@ -1693,10 +1722,31 @@ mod tests {
                 run_as_group: None,
             },
         };
-        let (user, home) = session_user_and_home(&policy);
+        let (user, home) = session_user_and_home(&policy, None);
         assert_eq!(user, "1000");
         // Numeric UID has no passwd entry — defaults to /sandbox.
         assert_eq!(home, "/sandbox");
+    }
+
+    #[test]
+    fn session_user_and_home_uses_driver_workspace_when_supplied() {
+        use openshell_core::policy::{
+            FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy,
+        };
+        let policy = SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy::default(),
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy {
+                run_as_user: Some("1234".into()),
+                run_as_group: Some("1235".into()),
+            },
+        };
+
+        let (user, home) = session_user_and_home(&policy, Some("/workspace/project"));
+        assert_eq!(user, "1234");
+        assert_eq!(home, "/workspace/project");
     }
 
     #[test]
@@ -1714,7 +1764,7 @@ mod tests {
                 run_as_group: None,
             },
         };
-        let (user, home) = session_user_and_home(&policy);
+        let (user, home) = session_user_and_home(&policy, None);
         assert_eq!(user, "sandbox");
         // Name-based — should resolve via passwd (or /home/{user}).
         assert!(!home.is_empty());
@@ -1735,7 +1785,7 @@ mod tests {
                 run_as_group: None,
             },
         };
-        let (user, home) = session_user_and_home(&policy);
+        let (user, home) = session_user_and_home(&policy, None);
         assert_eq!(user, "sandbox");
         assert_eq!(home, "/sandbox");
     }
@@ -1755,7 +1805,7 @@ mod tests {
                 run_as_group: None,
             },
         };
-        let (user, home) = session_user_and_home(&policy);
+        let (user, home) = session_user_and_home(&policy, None);
         assert_eq!(user, "sandbox");
         assert_eq!(home, "/sandbox");
     }
@@ -1775,7 +1825,7 @@ mod tests {
                 run_as_group: None,
             },
         };
-        let (user, home) = session_user_and_home(&policy);
+        let (user, home) = session_user_and_home(&policy, None);
         assert_eq!(user, "1000660000");
         assert_eq!(home, "/sandbox");
     }

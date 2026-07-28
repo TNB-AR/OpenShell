@@ -8,14 +8,23 @@ isolation enforcement to the `openshell-sandbox` supervisor binary, which is
 sideloaded into each container via an OCI image volume mount.
 
 Before creating the container, the driver inspects the final sandbox image and
-captures its immutable image ID and raw OCI `Config.User`. Container creation
-uses that image ID with pulling disabled, preventing a mutable tag from changing
-between inspection and launch. The supervisor runs as root, resolves omitted
-policy identity fields from the image declaration, and drops only agent
-children to the completed identity. Named OCI components remain names after
-validation; a missing group is filled with the user's numeric primary GID. Explicit
-`process.run_as_user` and `process.run_as_group` values take precedence
-independently.
+captures its immutable image ID, raw OCI `Config.User`, and OCI
+`Config.WorkingDir`. Container creation uses that image ID with pulling
+disabled, preventing a mutable tag from changing between inspection and launch.
+The supervisor runs as root, resolves omitted policy identity fields from the
+image declaration, and drops only agent children to the completed identity.
+Named OCI components remain names after validation; a missing group is filled
+with the user's numeric primary GID. Explicit `process.run_as_user` and
+`process.run_as_group` values take precedence independently.
+
+An absolute OCI working directory becomes the agent workspace. An empty or
+root (`/`) declaration falls back to `/sandbox`, which OpenShell creates when
+necessary. The supervisor transfers ownership of only the workspace directory
+to the completed identity before direct or SSH children start. Existing
+contents and nested bind or volume mounts retain their ownership. The workspace
+is the child cwd and `HOME`, and the Podman-managed workspace volume is mounted
+there so normal volume copy-up preserves image content. An invalid, symlinked,
+or unpreparable workspace fails sandbox startup.
 
 For a rootless networking deep dive, see [NETWORKING.md](NETWORKING.md).
 
@@ -87,9 +96,10 @@ optional `selinux_label` of `shared` (applies `:z`) or `private` (applies
 read-only by default; set `read_only: false` to make them writable. Podman
 image and volume mounts do not support `subpath` in OpenShell driver config.
 Mount `source` and `target` values must not contain surrounding whitespace.
-Mount targets must be absolute container paths and must not replace
-the workspace root (`/sandbox`) or overlap OpenShell supervisor files,
-`/etc/openshell`, `/etc/openshell-tls`, or `/run/netns`.
+Mount targets must be absolute container paths and must not replace the
+resolved workspace root. Nested workspace mounts remain valid. Mounts also
+must not overlap OpenShell supervisor files, `/etc/openshell`,
+`/etc/openshell-tls`, or `/run/netns`.
 
 Example named-volume usage:
 

@@ -585,6 +585,10 @@ impl PodmanComputeDriver {
             .config
             .as_ref()
             .map_or("", |config| config.user.as_str());
+        let image_working_dir = inspected_image
+            .config
+            .as_ref()
+            .map_or("", |config| config.working_dir.as_str());
 
         for image in
             container::podman_driver_image_mount_sources(sandbox, self.config.enable_bind_mounts)
@@ -652,6 +656,7 @@ impl PodmanComputeDriver {
             image,
             &inspected_image.id,
             image_user,
+            image_working_dir,
         ) {
             Ok(spec) => spec,
             Err(e) => {

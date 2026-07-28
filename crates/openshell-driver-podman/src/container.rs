@@ -612,6 +612,7 @@ pub fn podman_driver_image_mount_sources(
 fn podman_user_mounts(
     sandbox: &DriverSandbox,
     enable_bind_mounts: bool,
+    workspace_root: &str,
 ) -> Result<PodmanUserMounts, String> {
     let template = sandbox
         .spec
@@ -623,6 +624,13 @@ fn podman_user_mounts(
     let config = podman_driver_config(template, enable_bind_mounts)?;
     let mut result = PodmanUserMounts::default();
     for mount in config.mounts {
+        let target = match &mount {
+            PodmanDriverMountConfig::Bind { target, .. }
+            | PodmanDriverMountConfig::Volume { target, .. }
+            | PodmanDriverMountConfig::Tmpfs { target, .. }
+            | PodmanDriverMountConfig::Image { target, .. } => target,
+        };
+        driver_mounts::validate_workspace_mount_target(target, workspace_root)?;
         match mount {
             PodmanDriverMountConfig::Bind {
                 source,
@@ -905,6 +913,7 @@ pub fn build_container_spec_with_token_and_gpu_devices(
         image,
         image,
         "",
+        "",
     )
 }
 
@@ -916,14 +925,17 @@ pub fn build_container_spec_for_image(
     requested_image: &str,
     image_id: &str,
     oci_user: &str,
+    oci_working_dir: &str,
 ) -> Result<Value, ComputeDriverError> {
     let name = container_name(&sandbox.workspace, &sandbox.name, &sandbox.id);
     let vol = volume_name(&sandbox.id);
+    let workspace_root = driver_mounts::resolve_oci_workspace_root(oci_working_dir)
+        .map_err(ComputeDriverError::Precondition)?;
 
     let env = build_env(sandbox, config, requested_image, oci_user);
     let labels = build_labels(sandbox);
     let resource_limits = build_resource_limits(sandbox, config);
-    let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts)
+    let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts, &workspace_root)
         .map_err(ComputeDriverError::InvalidArgument)?;
     if sandbox
         .spec
@@ -952,7 +964,7 @@ pub fn build_container_spec_for_image(
 
     let mut volumes = vec![NamedVolume {
         name: vol,
-        dest: "/sandbox".into(),
+        dest: workspace_root.clone(),
         options: vec!["rw".into()],
     }];
     volumes.extend(user_mounts.volumes);
@@ -963,6 +975,9 @@ pub fn build_container_spec_for_image(
         rw: false,
     }];
     image_volumes.extend(user_mounts.image_volumes);
+
+    let mut command = vec!["--workdir".to_string(), workspace_root];
+    command.extend(upstream_proxy_cli_args(config));
 
     let container_spec = ContainerSpec {
         name,
@@ -987,7 +1002,7 @@ pub fn build_container_spec_for_image(
         // Operator-owned corporate proxy flags. The workload command is not
         // part of argv (the supervisor takes it from the reserved command
         // env var), so these flags are the whole command list.
-        command: upstream_proxy_cli_args(config),
+        command,
         // Force the supervisor to run as root (UID 0). Sandbox images may
         // set a non-root USER directive (e.g. `USER sandbox`), but the
         // supervisor needs root to create network namespaces, set up the
@@ -1379,6 +1394,7 @@ mod tests {
             "registry.example/app:latest",
             "sha256:immutable",
             "app:staff",
+            "/workspace/project",
         )
         .unwrap();
 
@@ -1389,6 +1405,17 @@ mod tests {
         );
         assert_eq!(container["user"].as_str(), Some("0:0"));
         assert_eq!(container["image_pull_policy"].as_str(), Some("never"));
+        assert_eq!(
+            container["command"],
+            serde_json::json!(["--workdir", "/workspace/project"])
+        );
+        assert!(container["volumes"].as_array().is_some_and(|volumes| {
+            volumes.iter().any(|volume| {
+                volume["name"].as_str() == Some("openshell-sandbox-test-id-workspace")
+                    && volume["dest"].as_str() == Some("/workspace/project")
+                    && volume["options"] == serde_json::json!(["rw"])
+            })
+        }));
         assert_eq!(
             container["env"][openshell_core::sandbox_env::OCI_IMAGE_USER].as_str(),
             Some("app:staff")
@@ -1401,6 +1428,89 @@ mod tests {
             container["env"][openshell_core::sandbox_env::SANDBOX_GID].as_str(),
             Some("")
         );
+    }
+
+    #[test]
+    fn container_spec_rejects_invalid_oci_working_dir() {
+        let err = build_container_spec_for_image(
+            &test_sandbox("test-id", "test-name"),
+            &test_config(),
+            None,
+            None,
+            "registry.example/app:latest",
+            "sha256:immutable",
+            "app:staff",
+            "relative/workspace",
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("must be an absolute container path")
+        );
+    }
+
+    #[test]
+    fn container_spec_reserves_resolved_workspace_root_but_allows_nested_mounts() {
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(openshell_core::proto::compute::v1::DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate::default()),
+            ..Default::default()
+        });
+        sandbox
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .as_mut()
+            .unwrap()
+            .driver_config = Some(json_struct(serde_json::json!({
+            "mounts": [{
+                "type": "tmpfs",
+                "target": "/workspace"
+            }]
+        })));
+
+        let err = build_container_spec_for_image(
+            &sandbox,
+            &test_config(),
+            None,
+            None,
+            "registry.example/app:latest",
+            "sha256:immutable",
+            "app:staff",
+            "/workspace",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("reserved for the OpenShell workspace")
+        );
+
+        sandbox
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .as_mut()
+            .unwrap()
+            .driver_config = Some(json_struct(serde_json::json!({
+            "mounts": [{
+                "type": "tmpfs",
+                "target": "/workspace/cache"
+            }]
+        })));
+        build_container_spec_for_image(
+            &sandbox,
+            &test_config(),
+            None,
+            None,
+            "registry.example/app:latest",
+            "sha256:immutable",
+            "app:staff",
+            "/workspace",
+        )
+        .expect("nested workspace mounts remain supported");
     }
 
     #[test]

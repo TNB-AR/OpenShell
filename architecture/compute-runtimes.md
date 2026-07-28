@@ -131,7 +131,8 @@ The gateway preserves whether each policy process field was omitted. The active
 driver then supplies one authoritative identity input to the supervisor:
 
 - Docker and Podman inspect the final sandbox image, pin container creation to
-  its immutable image ID, and pass its raw OCI `Config.User`.
+  its immutable image ID, and pass its raw OCI `Config.User`. They also resolve
+  the workspace from OCI `Config.WorkingDir` during that inspection.
 - Kubernetes passes its platform-resolved numeric UID/GID, including OpenShift
   SCC-derived values.
 - VM keeps its existing guest identity behavior.
@@ -143,6 +144,16 @@ the image. The supervisor resolves names from the image's `/etc/passwd` and
 and uses the same privilege-drop path for direct and SSH children. When a
 declaration omits the group, the supervisor fills it with the user's numeric
 primary GID. It does not rewrite the account files.
+
+Docker and Podman use an absolute OCI working directory as the workspace. An
+empty or root (`/`) declaration falls back to `/sandbox`, which OpenShell
+creates inside the container when needed. Before direct or SSH children start,
+the supervisor transfers ownership of only the workspace directory to the
+completed UID/GID. Image-provided contents and nested mounts retain their
+ownership. The resolved workspace is also the child cwd and `HOME`, the
+automatic writable policy path, and Podman's managed workspace-volume mount
+target. Kubernetes/OpenShift keep their `/sandbox` PVC and `fsGroup` behavior,
+and VM keeps its `/sandbox` guest initialization path.
 
 Sandbox creation fails before the workload becomes ready when a required image
 identity is absent, malformed, unknown, ambiguous, or resolves to UID/GID 0.
