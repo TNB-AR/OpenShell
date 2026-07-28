@@ -584,6 +584,7 @@ fn container_creation_uses_inspected_immutable_image() {
 
     assert_eq!(body.image.as_deref(), Some("sha256:immutable"));
     assert_eq!(body.user.as_deref(), Some("0"));
+    assert_eq!(body.working_dir.as_deref(), Some("/"));
     assert_eq!(
         body.cmd.as_deref(),
         Some(&["--workdir".to_string(), "/workspace/project".to_string()][..])
@@ -615,6 +616,26 @@ fn container_creation_rejects_invalid_oci_working_dir() {
 }
 
 #[test]
+fn container_creation_rejects_protected_oci_working_dir() {
+    let metadata = DockerImageMetadata {
+        id: "sha256:immutable".to_string(),
+        user: "1234:1235".to_string(),
+        working_dir: "/etc".to_string(),
+    };
+    let err = build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &DockerSandboxDriverConfig::default(),
+        None,
+        &metadata,
+    )
+    .unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("protected container path"));
+}
+
+#[test]
 fn container_creation_reserves_resolved_workspace_root_but_allows_nested_mounts() {
     let metadata = DockerImageMetadata {
         id: "sha256:immutable".to_string(),
@@ -631,6 +652,27 @@ fn container_creation_reserves_resolved_workspace_root_but_allows_nested_mounts(
         &root_mount,
         None,
         &metadata,
+    )
+    .unwrap_err();
+    assert!(
+        err.message()
+            .contains("reserved for the OpenShell workspace")
+    );
+
+    let ancestor_mount: DockerSandboxDriverConfig = serde_json::from_value(serde_json::json!({
+        "mounts": [{"type": "tmpfs", "target": "/workspace"}]
+    }))
+    .unwrap();
+    let nested_metadata = DockerImageMetadata {
+        working_dir: "/workspace/project".to_string(),
+        ..metadata.clone()
+    };
+    let err = build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &ancestor_mount,
+        None,
+        &nested_metadata,
     )
     .unwrap_err();
     assert!(

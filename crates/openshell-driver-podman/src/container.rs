@@ -3,6 +3,7 @@
 
 //! Container spec construction for the Podman driver.
 
+use crate::client::ImageInspect;
 use crate::config::PodmanComputeConfig;
 use openshell_core::ComputeDriverError;
 use openshell_core::driver_mounts::SelinuxLabel;
@@ -190,6 +191,9 @@ struct ContainerSpec {
     volumes: Vec<NamedVolume>,
     image_volumes: Vec<ImageVolume>,
     hostname: String,
+    /// Start the supervisor independently of the image workspace. The
+    /// supervisor validates and prepares that workspace before child launch.
+    work_dir: String,
     /// Overrides the image's ENTRYPOINT. In Podman's libpod API, `command`
     /// only overrides CMD (appended as args to the entrypoint). We must set
     /// `entrypoint` explicitly so the supervisor binary runs directly,
@@ -911,9 +915,10 @@ pub fn build_container_spec_with_token_and_gpu_devices(
         token_secret_name,
         gpu_device_ids,
         image,
-        image,
-        "",
-        "",
+        &ImageInspect {
+            id: image.to_string(),
+            config: None,
+        },
     )
 }
 
@@ -923,12 +928,18 @@ pub fn build_container_spec_for_image(
     token_secret_name: Option<&str>,
     gpu_device_ids: Option<&[String]>,
     requested_image: &str,
-    image_id: &str,
-    oci_user: &str,
-    oci_working_dir: &str,
+    inspected_image: &ImageInspect,
 ) -> Result<Value, ComputeDriverError> {
     let name = container_name(&sandbox.workspace, &sandbox.name, &sandbox.id);
     let vol = volume_name(&sandbox.id);
+    let oci_user = inspected_image
+        .config
+        .as_ref()
+        .map_or("", |config| config.user.as_str());
+    let oci_working_dir = inspected_image
+        .config
+        .as_ref()
+        .map_or("", |config| config.working_dir.as_str());
     let workspace_root = driver_mounts::resolve_oci_workspace_root(oci_working_dir)
         .map_err(ComputeDriverError::Precondition)?;
 
@@ -981,7 +992,7 @@ pub fn build_container_spec_for_image(
 
     let container_spec = ContainerSpec {
         name,
-        image: image_id.to_string(),
+        image: inspected_image.id.clone(),
         labels,
         env,
         volumes,
@@ -992,6 +1003,7 @@ pub fn build_container_spec_for_image(
         // /openshell-sandbox, so it appears at /opt/openshell/bin/openshell-sandbox.
         image_volumes,
         hostname: format!("sandbox-{}", sandbox.name),
+        work_dir: "/".to_string(),
         // Override the image's ENTRYPOINT so the supervisor binary runs
         // directly. Sandbox images (e.g. the community base image) set
         // ENTRYPOINT ["/bin/bash"], and Podman's `command` field only
@@ -1269,6 +1281,7 @@ fn parse_memory_to_bytes(quantity: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::ImageConfig;
     use openshell_core::proto::compute::v1::{GpuResourceRequirements, ResourceRequirements};
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
@@ -1285,6 +1298,16 @@ mod tests {
     fn gpu_resources(count: Option<u32>) -> ResourceRequirements {
         ResourceRequirements {
             gpu: Some(GpuResourceRequirements { count }),
+        }
+    }
+
+    fn inspected_image(id: &str, user: &str, working_dir: &str) -> ImageInspect {
+        ImageInspect {
+            id: id.to_string(),
+            config: Some(ImageConfig {
+                user: user.to_string(),
+                working_dir: working_dir.to_string(),
+            }),
         }
     }
 
@@ -1392,9 +1415,7 @@ mod tests {
             None,
             None,
             "registry.example/app:latest",
-            "sha256:immutable",
-            "app:staff",
-            "/workspace/project",
+            &inspected_image("sha256:immutable", "app:staff", "/workspace/project"),
         )
         .unwrap();
 
@@ -1409,6 +1430,7 @@ mod tests {
             container["command"],
             serde_json::json!(["--workdir", "/workspace/project"])
         );
+        assert_eq!(container["work_dir"].as_str(), Some("/"));
         assert!(container["volumes"].as_array().is_some_and(|volumes| {
             volumes.iter().any(|volume| {
                 volume["name"].as_str() == Some("openshell-sandbox-test-id-workspace")
@@ -1438,9 +1460,7 @@ mod tests {
             None,
             None,
             "registry.example/app:latest",
-            "sha256:immutable",
-            "app:staff",
-            "relative/workspace",
+            &inspected_image("sha256:immutable", "app:staff", "relative/workspace"),
         )
         .unwrap_err();
 
@@ -1448,6 +1468,21 @@ mod tests {
             err.to_string()
                 .contains("must be an absolute container path")
         );
+    }
+
+    #[test]
+    fn container_spec_rejects_protected_oci_working_dir() {
+        let err = build_container_spec_for_image(
+            &test_sandbox("test-id", "test-name"),
+            &test_config(),
+            None,
+            None,
+            "registry.example/app:latest",
+            &inspected_image("sha256:immutable", "app:staff", "/etc"),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("protected container path"));
     }
 
     #[test]
@@ -1477,9 +1512,34 @@ mod tests {
             None,
             None,
             "registry.example/app:latest",
-            "sha256:immutable",
-            "app:staff",
-            "/workspace",
+            &inspected_image("sha256:immutable", "app:staff", "/workspace"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("reserved for the OpenShell workspace")
+        );
+
+        sandbox
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .as_mut()
+            .unwrap()
+            .driver_config = Some(json_struct(serde_json::json!({
+            "mounts": [{
+                "type": "tmpfs",
+                "target": "/workspace"
+            }]
+        })));
+        let err = build_container_spec_for_image(
+            &sandbox,
+            &test_config(),
+            None,
+            None,
+            "registry.example/app:latest",
+            &inspected_image("sha256:immutable", "app:staff", "/workspace/project"),
         )
         .unwrap_err();
         assert!(
@@ -1506,9 +1566,7 @@ mod tests {
             None,
             None,
             "registry.example/app:latest",
-            "sha256:immutable",
-            "app:staff",
-            "/workspace",
+            &inspected_image("sha256:immutable", "app:staff", "/workspace"),
         )
         .expect("nested workspace mounts remain supported");
     }

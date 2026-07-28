@@ -1280,9 +1280,14 @@ fn prepare_oci_workspace_with(
     gid: Option<Gid>,
     do_chown: &impl Fn(&Path, Option<Uid>, Option<Gid>) -> nix::Result<()>,
 ) -> Result<()> {
-    if !root.is_absolute() || root == Path::new("/") {
+    let root_str = root
+        .to_str()
+        .ok_or_else(|| miette::miette!("workspace path must be valid UTF-8"))?;
+    let validated_root = openshell_core::driver_mounts::resolve_oci_workspace_root(root_str)
+        .map_err(|error| miette::miette!(error))?;
+    if Path::new(&validated_root) != root {
         return Err(miette::miette!(
-            "workspace path '{}' must be an absolute non-root path",
+            "workspace path '{}' must be a normalized absolute non-root path",
             root.display()
         ));
     }

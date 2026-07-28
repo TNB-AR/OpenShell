@@ -240,9 +240,10 @@ Podman mount schema:
 Podman `volume` and `image` mounts do not support `subpath` in OpenShell driver
 config, and OpenShell rejects `subpath` for those mount types. OpenShell rejects
 mount `source` and `target` values with surrounding whitespace. OpenShell also
-rejects mount targets that replace the workspace root, container root, supervisor
-files, `/etc/openshell`, `/etc/openshell-tls`, authentication material, or
-network namespace paths. These checks do not make host bind mounts safe.
+rejects mount targets that replace or contain the workspace root, target the
+container root or supervisor files, or overlap `/etc/openshell`,
+`/etc/openshell-tls`, authentication material, or network namespace paths.
+These checks do not make host bind mounts safe.
 
 ## MicroVM Driver
 
@@ -438,8 +439,10 @@ agent workspace; an empty or root (`/`) value falls back to `/sandbox`.
 OpenShell creates the resolved directory when needed and transfers ownership of
 only that directory to the completed UID/GID. Existing image contents and
 nested bind or volume mounts retain their ownership. The resolved workspace is
-the cwd and `HOME` for direct and SSH children. Sandbox startup fails before
-readiness when the declaration is invalid or the workspace cannot be prepared.
+the cwd and `HOME` for direct and SSH children. Protected system trees and
+OpenShell-reserved paths cannot become workspaces. The supervisor itself starts
+from `/`, so a missing or invalid workspace is handled during readiness instead
+of preventing the container from starting.
 
 Sandbox creation fails before readiness if a required `USER` component is
 missing, malformed, unknown, ambiguous, or resolves to UID/GID 0. An image

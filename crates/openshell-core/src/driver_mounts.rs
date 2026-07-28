@@ -32,6 +32,46 @@ const RESERVED_MOUNT_TARGETS: &[&str] = &[
     "/run/netns",
 ];
 
+/// Container filesystem trees that image metadata must never turn into an
+/// agent-owned writable workspace.
+const PROTECTED_WORKSPACE_TREES: &[&str] = &[
+    "/bin",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/lib",
+    "/lib64",
+    "/proc",
+    "/root",
+    "/run",
+    "/sbin",
+    "/sys",
+    "/usr/bin",
+    "/usr/lib",
+    "/usr/lib64",
+    "/usr/local/bin",
+    "/usr/local/lib",
+    "/usr/local/lib64",
+    "/usr/local/sbin",
+    "/usr/local/share",
+    "/usr/sbin",
+    "/usr/share",
+    "/var/log",
+];
+
+/// Broad container roots that are unsafe as workspaces themselves, while
+/// application-specific descendants remain valid.
+const PROTECTED_WORKSPACE_ROOTS: &[&str] = &[
+    "/home",
+    "/mnt",
+    "/opt",
+    "/srv",
+    "/usr",
+    "/usr/local",
+    "/var",
+    "/var/lib",
+];
+
 /// Compatibility workspace used when an OCI image has no usable working
 /// directory and by drivers whose workspace remains fixed.
 pub const DEFAULT_WORKSPACE_ROOT: &str = "/sandbox";
@@ -139,8 +179,11 @@ pub fn resolve_oci_workspace_root(working_dir: &str) -> Result<String, String> {
     if working_dir.is_empty() || working_dir == "/" {
         return Ok(DEFAULT_WORKSPACE_ROOT.to_string());
     }
-    if working_dir.as_bytes().contains(&0) {
-        return Err("OCI WorkingDir must not contain NUL bytes".to_string());
+    if working_dir != working_dir.trim() {
+        return Err("OCI WorkingDir must not contain surrounding whitespace".to_string());
+    }
+    if working_dir.chars().any(char::is_control) {
+        return Err("OCI WorkingDir must not contain control characters".to_string());
     }
     if !working_dir.starts_with('/') {
         return Err(format!(
@@ -159,13 +202,32 @@ pub fn resolve_oci_workspace_root(working_dir: &str) -> Result<String, String> {
         ));
     }
 
-    Ok(working_dir.trim_end_matches('/').to_string())
+    let workspace_root = working_dir.trim_end_matches('/').to_string();
+    let workspace_path = Path::new(&workspace_root);
+    if PROTECTED_WORKSPACE_ROOTS
+        .iter()
+        .any(|protected| workspace_path == Path::new(protected))
+        || PROTECTED_WORKSPACE_TREES
+            .iter()
+            .any(|protected| path_is_or_under(workspace_path, Path::new(protected)))
+        || RESERVED_MOUNT_TARGETS.iter().any(|reserved| {
+            let reserved = Path::new(reserved);
+            path_is_or_under(workspace_path, reserved) || path_is_or_under(reserved, workspace_path)
+        })
+    {
+        return Err(format!(
+            "OCI WorkingDir '{working_dir}' conflicts with a protected container path"
+        ));
+    }
+
+    Ok(workspace_root)
 }
 
-/// Reject a user-supplied mount that would replace the resolved workspace
-/// root. Mounts below the workspace remain valid.
+/// Reject a user-supplied mount that would replace or contain the resolved
+/// workspace root. Mounts below the workspace remain valid.
 pub fn validate_workspace_mount_target(target: &str, workspace_root: &str) -> Result<(), String> {
-    if normalize_mount_target(target) == workspace_root {
+    let normalized_target = normalize_mount_target(target);
+    if path_is_or_under(Path::new(workspace_root), Path::new(&normalized_target)) {
         return Err(format!(
             "mount target '{target}' is reserved for the OpenShell workspace"
         ));
@@ -202,6 +264,8 @@ mod tests {
         validate_workspace_mount_target("/sandbox/", "/sandbox").unwrap_err();
         validate_workspace_mount_target("/workspace/", "/sandbox").unwrap();
         validate_workspace_mount_target("/workspace/cache", "/workspace").unwrap();
+        validate_workspace_mount_target("/workspace", "/workspace/project").unwrap_err();
+        validate_workspace_mount_target("/workspace-other", "/workspace/project").unwrap();
     }
 
     #[test]
@@ -227,10 +291,45 @@ mod tests {
             "/workspace/./project",
             "/workspace//project",
             "/workspace\0project",
+            "/workspace ",
+            "/workspace\nproject",
         ] {
             assert!(
                 resolve_oci_workspace_root(invalid).is_err(),
                 "expected '{invalid}' to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn oci_workspace_root_rejects_protected_container_paths() {
+        for invalid in [
+            "/etc",
+            "/etc/project",
+            "/usr",
+            "/usr/bin/project",
+            "/var",
+            "/var/log/project",
+            "/opt",
+            "/opt/openshell/project",
+        ] {
+            assert!(
+                resolve_oci_workspace_root(invalid).is_err(),
+                "expected protected workspace '{invalid}' to be rejected"
+            );
+        }
+
+        for valid in [
+            "/app",
+            "/home/app",
+            "/opt/app",
+            "/usr/src/app",
+            "/var/lib/app",
+        ] {
+            assert_eq!(
+                resolve_oci_workspace_root(valid).unwrap(),
+                valid,
+                "expected application workspace '{valid}' to remain valid"
             );
         }
     }

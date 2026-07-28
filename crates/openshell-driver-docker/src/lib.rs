@@ -2436,6 +2436,9 @@ fn build_container_create_body_for_image(
     Ok(ContainerCreateBody {
         image: Some(image.id.clone()),
         user: Some("0".to_string()),
+        // The image workspace may need to be created or rejected by the
+        // supervisor, so do not let the OCI runtime chdir there first.
+        working_dir: Some("/".to_string()),
         env: Some(build_environment_for_oci_user(sandbox, config, &image.user)),
         entrypoint: Some(vec![SUPERVISOR_MOUNT_PATH.to_string()]),
         // Clear the image CMD so Docker does not append inherited args to the

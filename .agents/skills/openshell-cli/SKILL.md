@@ -223,8 +223,8 @@ openshell sandbox ssh-config my-sandbox >> ~/.ssh/config
 # Upload local files to the sandbox working directory
 openshell sandbox upload my-sandbox ./src
 
-# Download files from sandbox
-openshell sandbox download my-sandbox /sandbox/output ./local-output
+# Download files from sandbox (replace /workspace with the path from `pwd -P`)
+openshell sandbox download my-sandbox /workspace/output ./local-output
 ```
 
 Uploads honor `.gitignore` by default. Add `--no-git-ignore` only when ignored files are intentionally in scope.

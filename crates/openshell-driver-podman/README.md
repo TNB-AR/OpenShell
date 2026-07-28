@@ -23,8 +23,10 @@ necessary. The supervisor transfers ownership of only the workspace directory
 to the completed identity before direct or SSH children start. Existing
 contents and nested bind or volume mounts retain their ownership. The workspace
 is the child cwd and `HOME`, and the Podman-managed workspace volume is mounted
-there so normal volume copy-up preserves image content. An invalid, symlinked,
-or unpreparable workspace fails sandbox startup.
+there so normal volume copy-up preserves image content. Protected system trees
+and OpenShell-reserved paths cannot become workspaces. The supervisor starts
+from `/`, then reports an invalid, symlinked, or unpreparable workspace as a
+readiness failure.
 
 For a rootless networking deep dive, see [NETWORKING.md](NETWORKING.md).
 
@@ -97,8 +99,8 @@ read-only by default; set `read_only: false` to make them writable. Podman
 image and volume mounts do not support `subpath` in OpenShell driver config.
 Mount `source` and `target` values must not contain surrounding whitespace.
 Mount targets must be absolute container paths and must not replace the
-resolved workspace root. Nested workspace mounts remain valid. Mounts also
-must not overlap OpenShell supervisor files, `/etc/openshell`,
+resolved workspace root or any of its parents. Nested workspace mounts remain
+valid. Mounts also must not overlap OpenShell supervisor files, `/etc/openshell`,
 `/etc/openshell-tls`, or `/run/netns`.
 
 Example named-volume usage:

@@ -1115,7 +1115,15 @@ async fn ssh_run_capture_stdout(session: &SshSessionConfig, command: &str) -> Re
             output.status
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    decode_ssh_probe_stdout(output.stdout)
+}
+
+fn decode_ssh_probe_stdout(stdout: Vec<u8>) -> Result<String> {
+    let stdout = String::from_utf8(stdout)
+        .map_err(|error| miette::miette!("ssh probe returned non-UTF-8 output: {error}"))?;
+    let stdout = stdout.strip_suffix('\n').unwrap_or(&stdout);
+    let stdout = stdout.strip_suffix('\r').unwrap_or(stdout);
+    Ok(stdout.to_string())
 }
 
 fn validate_discovered_workspace_root(root: &str) -> Result<String> {
@@ -2090,6 +2098,19 @@ mod tests {
                 "expected '{invalid}' to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn ssh_probe_output_only_removes_the_protocol_line_ending() {
+        assert_eq!(
+            decode_ssh_probe_stdout(b"/workspace/project \n".to_vec()).unwrap(),
+            "/workspace/project "
+        );
+        assert_eq!(
+            decode_ssh_probe_stdout(b"/workspace/project\r\n".to_vec()).unwrap(),
+            "/workspace/project"
+        );
+        assert!(decode_ssh_probe_stdout(vec![0xff]).is_err());
     }
 
     #[test]

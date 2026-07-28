@@ -33,8 +33,9 @@ root (`/`) declaration falls back to `/sandbox`, which OpenShell creates when
 necessary. The supervisor transfers ownership of only the workspace directory
 to the completed identity before direct or SSH children start. Existing
 contents and nested bind or volume mounts retain their ownership. The workspace
-is the child cwd and `HOME`; an invalid, symlinked, or unpreparable workspace
-fails sandbox startup.
+is the child cwd and `HOME`. Protected system trees and OpenShell-reserved
+paths cannot become workspaces. The supervisor starts from `/`, then reports an
+invalid, symlinked, or unpreparable workspace as a readiness failure.
 
 Docker containers join an OpenShell-managed bridge network. The driver injects
 `host.openshell.internal` and `host.docker.internal` so supervisors have stable
@@ -86,9 +87,10 @@ optional `selinux_label` of `shared` (applies `:z`) or `private` (applies
 `subpath`. User-supplied bind and volume mounts are read-only by default; set
 `read_only: false` to make them writable. Mount `source`, `target`, and
 `subpath` values must not contain surrounding whitespace. Mount targets must be
-absolute container paths and must not replace the resolved workspace root.
-Nested workspace mounts remain valid. Mounts also must not overlap OpenShell
-supervisor files, `/etc/openshell`, `/etc/openshell-tls`, or `/run/netns`.
+absolute container paths and must not replace or contain the resolved workspace
+root. Nested workspace mounts remain valid. Mounts also must not overlap
+OpenShell supervisor files, `/etc/openshell`, `/etc/openshell-tls`, or
+`/run/netns`.
 
 Example named-volume usage:
 
