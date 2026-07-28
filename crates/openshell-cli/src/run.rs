@@ -5377,11 +5377,7 @@ pub async fn sandbox_policy_set_global(
     eprintln!(
         "{} Global policy configured (hash: {}, settings revision: {})",
         "✓".green().bold(),
-        if response.policy_hash.len() >= 12 {
-            &response.policy_hash[..12]
-        } else {
-            &response.policy_hash
-        },
+        short_hash(&response.policy_hash),
         response.settings_revision,
     );
     Ok(())
@@ -6730,7 +6726,7 @@ pub async fn sandbox_draft_approve(
         "{} Chunk approved. Policy version: {}, hash: {}",
         "OK".green().bold(),
         inner.policy_version,
-        &inner.policy_hash[..12.min(inner.policy_hash.len())]
+        short_hash(&inner.policy_hash)
     );
 
     Ok(())
