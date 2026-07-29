@@ -19,6 +19,8 @@ use std::ffi::CString;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 #[cfg(any(test, unix))]
 use std::path::Path;
 use std::path::PathBuf;
@@ -1328,7 +1330,15 @@ fn prepare_oci_workspace_with(
         }
     }
 
-    do_chown(root, uid, gid).into_diagnostic()
+    do_chown(root, uid, gid).into_diagnostic()?;
+
+    let metadata = std::fs::symlink_metadata(root).into_diagnostic()?;
+    let mode = metadata.permissions().mode() & 0o7777;
+    if mode & 0o300 != 0o300 {
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(mode | 0o300))
+            .into_diagnostic()?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2561,6 +2571,24 @@ mod tests {
 
         assert_eq!(*chowned.lock().unwrap(), vec![root]);
         assert!(child.exists(), "image-provided child should be untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_oci_workspace_makes_existing_root_owner_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("sandbox");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        prepare_oci_workspace_with(&root, None, None, &|_, _, _| Ok(()))
+            .expect("read-only workspace root should be prepared");
+
+        let mode = std::fs::symlink_metadata(&root)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755);
     }
 
     #[cfg(unix)]
