@@ -121,24 +121,15 @@ jobs:
         run: ${{ matrix.cmd }}
 
   e2e-podman-rootless:
-    name: E2E (rust-podman-rootless, ${{ matrix.runner }})
+    name: E2E (rust-podman-rootless, ubuntu-26.04)
     # Run directly on the Ubuntu host so the test observes the host's AppArmor
     # and unprivileged-user-namespace policy. A privileged job container masks
     # the restrictions that production rootless Podman installations enforce.
-    runs-on: ${{ matrix.runner }}
+    # Ubuntu 26.04 provides the supported Podman 5.x and pasta combination.
+    # Re-add older/slirp4netns environments when direct callbacks through a
+    # rootless-network namespace relay are supported.
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Ubuntu 24.04 matches the environment reported in #2069 and ships
-          # Podman 4.x. The probe records whether AppArmor blocks the drop.
-          - runner: ubuntu-24.04
-            podman_major: "4"
-          # Ubuntu 26.04 provides the supported Podman 5.x coverage for
-          # comparison with the Ubuntu 24.04 environment.
-          - runner: ubuntu-26.04
-            podman_major: "5"
     env:
       IMAGE_TAG: ${{ inputs.image-tag }}
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -188,7 +179,6 @@ jobs:
             passt \
             pkg-config \
             podman \
-            slirp4netns \
             uidmap
 
       - name: Configure rootless Podman
@@ -209,10 +199,11 @@ jobs:
           set -euo pipefail
           podman_version="$(podman version --format '{{.Client.Version}}')"
           case "$podman_version" in
-            "${{ matrix.podman_major }}".*) ;;
-            *) echo "ERROR: expected Podman ${{ matrix.podman_major }}.x, found $podman_version" >&2; exit 1 ;;
+            5.*) ;;
+            *) echo "ERROR: expected Podman 5.x, found $podman_version" >&2; exit 1 ;;
           esac
           test "$(podman info --format '{{.Host.Security.Rootless}}')" = "true"
+          test "$(podman info --format '{{.Host.RootlessNetworkCmd}}')" = "pasta"
           test "$(sudo sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = "1"
           echo "=== host ==="
           uname -a
