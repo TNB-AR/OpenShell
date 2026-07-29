@@ -8,6 +8,98 @@ use openshell_core::proto::{ObjectForTest, Sandbox, SandboxPolicy, SandboxSpec};
 use prost::Message;
 use std::collections::HashMap as StdHashMap;
 
+/// A failed store call must be visible as a failure in the trace, not as a
+/// span that merely happened to return nothing.
+#[tokio::test]
+async fn failed_store_calls_are_marked_on_the_span() {
+    use crate::otel_tracing::test_collector;
+
+    let store = test_store().await;
+    let traced = test_collector::install_traced();
+    store.close_for_test().await;
+    store
+        .get("sandbox", "failed-store-call")
+        .await
+        .expect_err("a closed pool fails the query");
+
+    let span = traced.span_with("store.get", "object.id", "failed-store-call");
+
+    assert!(
+        matches!(span.status, opentelemetry::trace::Status::Error { .. }),
+        "the span carries error status so trace UIs flag it, got {:?}",
+        span.status
+    );
+}
+
+/// Losing a `MustCreate` race is how callers learn a record already exists, so
+/// the span must stay clean — otherwise every lease a replica does not win, and
+/// every gateway restart, exports as a failure.
+#[tokio::test]
+async fn expected_conflicts_leave_the_span_unmarked() {
+    use crate::otel_tracing::test_collector;
+
+    let store = test_store().await;
+    let traced = test_collector::install_traced();
+    let put = async |id: &str| {
+        store
+            .put_if(
+                "workspace",
+                id,
+                "expected-conflict",
+                "",
+                b"payload",
+                None,
+                super::WriteCondition::MustCreate,
+            )
+            .await
+    };
+
+    put("expected-conflict-first").await.expect("first write");
+    put("expected-conflict-second")
+        .await
+        .expect_err("the name is already taken");
+
+    let span = traced.span_with("store.put_if", "object.id", "expected-conflict-second");
+
+    assert_eq!(
+        span.status,
+        opentelemetry::trace::Status::Unset,
+        "a unique violation is a return value the caller acts on, got {:?}",
+        span.status
+    );
+}
+
+/// Span names stay low-cardinality so they group across object types; what
+/// each call touched is carried as attributes.
+#[tokio::test]
+async fn store_spans_record_what_they_touched_as_attributes() {
+    use crate::otel_tracing::test_collector;
+
+    let store = test_store().await;
+    store
+        .put("sandbox", "abc", "my-sandbox", "default", b"payload", None)
+        .await
+        .unwrap();
+
+    let traced = test_collector::install_traced();
+    store.get("sandbox", "abc").await.unwrap();
+    store
+        .get_by_name("sandbox", "default", "my-sandbox")
+        .await
+        .unwrap();
+    store.list("sandbox", "default", 10, 0).await.unwrap();
+
+    let by_name = traced.span_with("store.get_by_name", "object.name", "my-sandbox");
+    assert_eq!(
+        test_collector::attribute(&by_name, "object_type").as_deref(),
+        Some("sandbox"),
+        "the span records which type it queried"
+    );
+
+    traced.span_with("store.get", "object.id", "abc");
+    traced.span_with("store.list", "object_type", "sandbox");
+}
+
 #[tokio::test]
 async fn sqlite_put_get_round_trip() {
     let store = test_store().await;
@@ -1768,5 +1860,58 @@ async fn list_by_scope_returns_resource_version() {
     assert_eq!(
         records[0].resource_version, 2,
         "list_by_scope must return the actual resource_version, not a default"
+    );
+}
+
+/// Store operations open a child span under whatever request span is active,
+/// so a trace decomposes an RPC into the storage work it did rather than
+/// bottoming out at the request boundary.
+#[tokio::test]
+async fn store_operations_export_child_spans_under_the_request_span() {
+    use tracing::Instrument as _;
+
+    use crate::otel_tracing::test_collector;
+
+    let store = test_store().await;
+
+    let traced = test_collector::install_traced();
+    async {
+        store
+            .list("sandbox", "default", 10, 0)
+            .await
+            .expect("list succeeds");
+    }
+    .instrument(tracing::info_span!("request"))
+    .await;
+
+    let spans = traced.finished_spans();
+    let root = spans
+        .iter()
+        .find(|s| s.name == "request")
+        .expect("root span recorded");
+    let child = spans
+        .iter()
+        .find(|s| s.name == "store.list")
+        .unwrap_or_else(|| {
+            panic!(
+                "a store span is recorded, got {:?}",
+                spans.iter().map(|s| &s.name).collect::<Vec<_>>()
+            )
+        });
+
+    assert_eq!(
+        child.parent_span_id,
+        root.span_context.span_id(),
+        "the store span is a child of the request span"
+    );
+    assert_eq!(
+        child.span_context.trace_id(),
+        root.span_context.trace_id(),
+        "both share one trace"
+    );
+    assert_eq!(
+        test_collector::attribute(child, "object_type").as_deref(),
+        Some("sandbox"),
+        "the store span records what it queried"
     );
 }

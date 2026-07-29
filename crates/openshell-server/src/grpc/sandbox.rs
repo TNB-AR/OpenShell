@@ -671,199 +671,205 @@ pub(super) async fn handle_watch_sandbox(
     let (tx, rx) = mpsc::channel::<Result<SandboxStreamEvent, Status>>(256);
     let state = state.clone();
 
-    // Spawn producer task.
-    tokio::spawn(async move {
-        // Validate that the sandbox exists BEFORE subscribing to any buses.
-        match state.store.get_message::<Sandbox>(&sandbox_id).await {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                let _ = tx.send(Err(Status::not_found("sandbox not found"))).await;
-                return;
+    // Spawn producer task. `tokio::spawn` detaches from the current span, so
+    // carry it across to keep the producer's store reads in the request trace.
+    let request_span = tracing::Span::current();
+    tokio::spawn(tracing::Instrument::instrument(
+        async move {
+            // Validate that the sandbox exists BEFORE subscribing to any buses.
+            match state.store.get_message::<Sandbox>(&sandbox_id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    let _ = tx.send(Err(Status::not_found("sandbox not found"))).await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(Status::internal(format!("fetch sandbox failed: {e}"))))
+                        .await;
+                    return;
+                }
             }
-            Err(e) => {
-                let _ = tx
-                    .send(Err(Status::internal(format!("fetch sandbox failed: {e}"))))
-                    .await;
-                return;
-            }
-        }
 
-        // Subscribe to all buses BEFORE reading the snapshot.
-        let mut status_rx = if follow_status {
-            Some(state.sandbox_watch_bus.subscribe(&sandbox_id))
-        } else {
-            None
-        };
-        let mut log_rx = if follow_logs {
-            Some(state.tracing_log_bus.subscribe(&sandbox_id))
-        } else {
-            None
-        };
-        let mut platform_rx = if follow_events {
-            Some(
-                state
-                    .tracing_log_bus
-                    .platform_event_bus
-                    .subscribe(&sandbox_id),
-            )
-        } else {
-            None
-        };
+            // Subscribe to all buses BEFORE reading the snapshot.
+            let mut status_rx = if follow_status {
+                Some(state.sandbox_watch_bus.subscribe(&sandbox_id))
+            } else {
+                None
+            };
+            let mut log_rx = if follow_logs {
+                Some(state.tracing_log_bus.subscribe(&sandbox_id))
+            } else {
+                None
+            };
+            let mut platform_rx = if follow_events {
+                Some(
+                    state
+                        .tracing_log_bus
+                        .platform_event_bus
+                        .subscribe(&sandbox_id),
+                )
+            } else {
+                None
+            };
 
-        // Re-read the snapshot now that we have subscriptions active.
-        match state.store.get_message::<Sandbox>(&sandbox_id).await {
-            Ok(Some(sandbox)) => {
-                state.sandbox_index.update_from_sandbox(&sandbox);
-                let _ = tx
-                    .send(Ok(SandboxStreamEvent {
-                        payload: Some(
-                            openshell_core::proto::sandbox_stream_event::Payload::Sandbox(
-                                sandbox.clone(),
+            // Re-read the snapshot now that we have subscriptions active.
+            match state.store.get_message::<Sandbox>(&sandbox_id).await {
+                Ok(Some(sandbox)) => {
+                    state.sandbox_index.update_from_sandbox(&sandbox);
+                    let _ = tx
+                        .send(Ok(SandboxStreamEvent {
+                            payload: Some(
+                                openshell_core::proto::sandbox_stream_event::Payload::Sandbox(
+                                    sandbox.clone(),
+                                ),
                             ),
-                        ),
-                    }))
-                    .await;
+                        }))
+                        .await;
 
-                if stop_on_terminal {
-                    let phase =
-                        SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
-                    if phase == SandboxPhase::Ready {
+                    if stop_on_terminal {
+                        let phase = SandboxPhase::try_from(sandbox.phase())
+                            .unwrap_or(SandboxPhase::Unknown);
+                        if phase == SandboxPhase::Ready {
+                            return;
+                        }
+                    }
+                }
+                Ok(None) => {
+                    let _ = tx.send(Err(Status::not_found("sandbox not found"))).await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(Status::internal(format!("fetch sandbox failed: {e}"))))
+                        .await;
+                    return;
+                }
+            }
+
+            // Replay tail logs (best-effort), filtered by log_since_ms and log_sources.
+            if follow_logs {
+                for evt in state.tracing_log_bus.tail(&sandbox_id, log_tail as usize) {
+                    if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(
+                        ref log,
+                    )) = evt.payload
+                    {
+                        if log_since_ms > 0 && log.timestamp_ms < log_since_ms {
+                            continue;
+                        }
+                        if !log_sources.is_empty() && !source_matches(&log.source, &log_sources) {
+                            continue;
+                        }
+                        if !level_matches(&log.level, &log_min_level) {
+                            continue;
+                        }
+                    }
+                    if tx.send(Ok(evt)).await.is_err() {
                         return;
                     }
                 }
             }
-            Ok(None) => {
-                let _ = tx.send(Err(Status::not_found("sandbox not found"))).await;
-                return;
-            }
-            Err(e) => {
-                let _ = tx
-                    .send(Err(Status::internal(format!("fetch sandbox failed: {e}"))))
-                    .await;
-                return;
-            }
-        }
 
-        // Replay tail logs (best-effort), filtered by log_since_ms and log_sources.
-        if follow_logs {
-            for evt in state.tracing_log_bus.tail(&sandbox_id, log_tail as usize) {
-                if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(ref log)) =
-                    evt.payload
+            // Replay buffered platform events.
+            if follow_events {
+                for evt in state
+                    .tracing_log_bus
+                    .platform_event_bus
+                    .tail(&sandbox_id, event_tail as usize)
                 {
-                    if log_since_ms > 0 && log.timestamp_ms < log_since_ms {
-                        continue;
+                    if tx.send(Ok(evt)).await.is_err() {
+                        return;
                     }
-                    if !log_sources.is_empty() && !source_matches(&log.source, &log_sources) {
-                        continue;
-                    }
-                    if !level_matches(&log.level, &log_min_level) {
-                        continue;
-                    }
-                }
-                if tx.send(Ok(evt)).await.is_err() {
-                    return;
                 }
             }
-        }
 
-        // Replay buffered platform events.
-        if follow_events {
-            for evt in state
-                .tracing_log_bus
-                .platform_event_bus
-                .tail(&sandbox_id, event_tail as usize)
-            {
-                if tx.send(Ok(evt)).await.is_err() {
-                    return;
-                }
-            }
-        }
-
-        loop {
-            tokio::select! {
-                res = async {
-                    match status_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => future::pending().await,
-                    }
-                } => {
-                    match res {
-                        Ok(()) => {
-                            match state.store.get_message::<Sandbox>(&sandbox_id).await {
-                                Ok(Some(sandbox)) => {
-                                    state.sandbox_index.update_from_sandbox(&sandbox);
-                                    if tx.send(Ok(SandboxStreamEvent { payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox.clone()))})).await.is_err() {
-                                        return;
-                                    }
-                                    if stop_on_terminal {
-                                        let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
-                                        if phase == SandboxPhase::Ready {
+            loop {
+                tokio::select! {
+                    res = async {
+                        match status_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => future::pending().await,
+                        }
+                    } => {
+                        match res {
+                            Ok(()) => {
+                                match state.store.get_message::<Sandbox>(&sandbox_id).await {
+                                    Ok(Some(sandbox)) => {
+                                        state.sandbox_index.update_from_sandbox(&sandbox);
+                                        if tx.send(Ok(SandboxStreamEvent { payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox.clone()))})).await.is_err() {
                                             return;
                                         }
+                                        if stop_on_terminal {
+                                            let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+                                            if phase == SandboxPhase::Ready {
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(Err(Status::internal(format!("fetch sandbox failed: {e}")))).await;
+                                        return;
                                     }
                                 }
-                                Ok(None) => {
-                                    return;
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(Err(Status::internal(format!("fetch sandbox failed: {e}")))).await;
-                                    return;
-                                }
                             }
-                        }
-                        Err(err) => {
-                            let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
-                            return;
-                        }
-                    }
-                }
-                res = async {
-                    match log_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => future::pending().await,
-                    }
-                } => {
-                    match res {
-                        Ok(evt) => {
-                            if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(ref log)) = evt.payload {
-                                if !log_sources.is_empty() && !source_matches(&log.source, &log_sources) {
-                                    continue;
-                                }
-                                if !level_matches(&log.level, &log_min_level) {
-                                    continue;
-                                }
-                            }
-                            if tx.send(Ok(evt)).await.is_err() {
+                            Err(err) => {
+                                let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
                                 return;
                             }
                         }
-                        Err(err) => {
-                            let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
-                            return;
+                    }
+                    res = async {
+                        match log_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => future::pending().await,
                         }
-                    }
-                }
-                res = async {
-                    match platform_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => future::pending().await,
-                    }
-                } => {
-                    match res {
-                        Ok(evt) => {
-                            if tx.send(Ok(evt)).await.is_err() {
+                    } => {
+                        match res {
+                            Ok(evt) => {
+                                if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(ref log)) = evt.payload {
+                                    if !log_sources.is_empty() && !source_matches(&log.source, &log_sources) {
+                                        continue;
+                                    }
+                                    if !level_matches(&log.level, &log_min_level) {
+                                        continue;
+                                    }
+                                }
+                                if tx.send(Ok(evt)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Err(err) => {
+                                let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
                                 return;
                             }
                         }
-                        Err(err) => {
-                            let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
-                            return;
+                    }
+                    res = async {
+                        match platform_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => future::pending().await,
+                        }
+                    } => {
+                        match res {
+                            Ok(evt) => {
+                                if tx.send(Ok(evt)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Err(err) => {
+                                let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
+                                return;
+                            }
                         }
                     }
                 }
             }
-        }
-    });
+        },
+        request_span,
+    ));
 
     Ok(Response::new(ReceiverStream::new(rx)))
 }
