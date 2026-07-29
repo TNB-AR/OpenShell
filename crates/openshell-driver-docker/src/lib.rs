@@ -644,19 +644,13 @@ impl DockerComputeDriver {
         Self::validate_sandbox_auth(sandbox)?;
         self.validate_user_volume_mounts_available(&validated.driver_config)
             .await?;
-        let gpu_devices = self
+        let _ = self
             .resolve_gpu_cdi_devices(
                 validated.gpu_requirements,
                 &validated.driver_config,
                 CdiGpuDefaultSelector::peek_device_ids,
             )
             .await?;
-        let _ = build_container_create_body_with_gpu_devices(
-            sandbox,
-            &self.config,
-            &validated.driver_config,
-            gpu_devices.as_deref(),
-        )?;
 
         if self
             .find_managed_container_summary(&sandbox.id, &sandbox.name)
@@ -2352,6 +2346,7 @@ fn build_container_create_body(
     build_container_create_body_with_gpu_devices(sandbox, config, &driver_config, cdi_devices)
 }
 
+#[cfg(test)]
 fn build_container_create_body_with_gpu_devices(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,

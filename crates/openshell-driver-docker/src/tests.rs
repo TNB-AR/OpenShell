@@ -692,6 +692,20 @@ fn container_creation_reserves_resolved_workspace_root_but_allows_nested_mounts(
         &metadata,
     )
     .expect("nested workspace mounts remain supported");
+
+    let compatibility_path_mount: DockerSandboxDriverConfig =
+        serde_json::from_value(serde_json::json!({
+            "mounts": [{"type": "tmpfs", "target": "/sandbox"}]
+        }))
+        .unwrap();
+    build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &compatibility_path_mount,
+        None,
+        &metadata,
+    )
+    .expect("/sandbox remains mountable when the inspected workspace is elsewhere");
 }
 
 #[test]

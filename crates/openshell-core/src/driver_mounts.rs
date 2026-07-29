@@ -35,42 +35,17 @@ const RESERVED_MOUNT_TARGETS: &[&str] = &[
 /// Container filesystem trees that image metadata must never turn into an
 /// agent-owned writable workspace.
 const PROTECTED_WORKSPACE_TREES: &[&str] = &[
-    "/bin",
-    "/boot",
-    "/dev",
-    "/etc",
-    "/lib",
-    "/lib64",
-    "/proc",
-    "/root",
-    "/run",
-    "/sbin",
-    "/sys",
-    "/usr/bin",
-    "/usr/lib",
-    "/usr/lib64",
-    "/usr/local/bin",
-    "/usr/local/lib",
-    "/usr/local/lib64",
-    "/usr/local/sbin",
-    "/usr/local/share",
-    "/usr/sbin",
-    "/usr/share",
-    "/var/log",
+    "/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/libexec", "/proc", "/root",
+    "/run", "/sbin", "/sys", "/usr", "/var",
 ];
+
+/// Narrow application workspace conventions allowed inside otherwise
+/// protected system trees.
+const ALLOWED_WORKSPACE_TREES: &[&str] = &["/usr/src/app", "/var/app", "/var/task", "/var/www"];
 
 /// Broad container roots that are unsafe as workspaces themselves, while
 /// application-specific descendants remain valid.
-const PROTECTED_WORKSPACE_ROOTS: &[&str] = &[
-    "/home",
-    "/mnt",
-    "/opt",
-    "/srv",
-    "/usr",
-    "/usr/local",
-    "/var",
-    "/var/lib",
-];
+const PROTECTED_WORKSPACE_ROOTS: &[&str] = &["/home", "/mnt", "/opt", "/srv"];
 
 /// Compatibility workspace used when an OCI image has no usable working
 /// directory and by drivers whose workspace remains fixed.
@@ -207,9 +182,12 @@ pub fn resolve_oci_workspace_root(working_dir: &str) -> Result<String, String> {
     if PROTECTED_WORKSPACE_ROOTS
         .iter()
         .any(|protected| workspace_path == Path::new(protected))
-        || PROTECTED_WORKSPACE_TREES
+        || (PROTECTED_WORKSPACE_TREES
             .iter()
             .any(|protected| path_is_or_under(workspace_path, Path::new(protected)))
+            && !ALLOWED_WORKSPACE_TREES
+                .iter()
+                .any(|allowed| path_is_or_under(workspace_path, Path::new(allowed))))
         || RESERVED_MOUNT_TARGETS.iter().any(|reserved| {
             let reserved = Path::new(reserved);
             path_is_or_under(workspace_path, reserved) || path_is_or_under(reserved, workspace_path)
@@ -308,10 +286,14 @@ mod tests {
             "/etc/project",
             "/usr",
             "/usr/bin/project",
+            "/usr/libexec/project",
             "/var",
             "/var/log/project",
+            "/var/lib/app",
+            "/var/lib/dpkg",
             "/opt",
             "/opt/openshell/project",
+            "/lib32/project",
         ] {
             assert!(
                 resolve_oci_workspace_root(invalid).is_err(),
@@ -324,7 +306,9 @@ mod tests {
             "/home/app",
             "/opt/app",
             "/usr/src/app",
-            "/var/lib/app",
+            "/var/app/current",
+            "/var/task",
+            "/var/www/app",
         ] {
             assert_eq!(
                 resolve_oci_workspace_root(valid).unwrap(),

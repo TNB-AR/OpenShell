@@ -34,8 +34,12 @@ necessary. The supervisor transfers ownership of only the workspace directory
 to the completed identity before direct or SSH children start. Existing
 contents and nested bind or volume mounts retain their ownership. The workspace
 is the child cwd and `HOME`. Protected system trees and OpenShell-reserved
-paths cannot become workspaces. The supervisor starts from `/`, then reports an
-invalid, symlinked, or unpreparable workspace as a readiness failure.
+paths cannot become workspaces. OpenShell protects `/usr` and `/var` except for
+the application conventions `/usr/src/app`, `/var/app`, `/var/task`, and
+`/var/www`. Existing workspace parents must be traversable by the resolved
+identity; OpenShell creates missing parents with mode `0755`. The supervisor
+starts from `/`, then reports an invalid, symlinked, or unpreparable workspace
+as a readiness failure.
 
 Docker containers join an OpenShell-managed bridge network. The driver injects
 `host.openshell.internal` and `host.docker.internal` so supervisors have stable

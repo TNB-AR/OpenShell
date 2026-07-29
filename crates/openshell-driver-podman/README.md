@@ -103,6 +103,11 @@ resolved workspace root or any of its parents. Nested workspace mounts remain
 valid. Mounts also must not overlap OpenShell supervisor files, `/etc/openshell`,
 `/etc/openshell-tls`, or `/run/netns`.
 
+OpenShell protects `/usr` and `/var` as OCI workspaces except for the
+application conventions `/usr/src/app`, `/var/app`, `/var/task`, and
+`/var/www`. Existing workspace parents must be traversable by the resolved
+identity; OpenShell creates missing parents with mode `0755`.
+
 Example named-volume usage:
 
 ```shell

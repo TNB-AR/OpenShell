@@ -148,12 +148,15 @@ primary GID. It does not rewrite the account files.
 Docker and Podman use an absolute OCI working directory as the workspace. An
 empty or root (`/`) declaration falls back to `/sandbox`, which OpenShell
 creates inside the container when needed. Protected system trees and
-OpenShell-reserved paths cannot become workspaces. The container runtime starts
-the supervisor from `/`; before direct or SSH children start, the supervisor
-validates the resolved path and transfers ownership of only the workspace
-directory to the completed UID/GID. Image-provided contents and nested mounts
-retain their ownership. The resolved workspace is also the child cwd and
-`HOME`, the automatic writable policy path, and Podman's managed
+OpenShell-reserved paths cannot become workspaces. `/usr` and `/var` are
+protected except for the reviewed application conventions `/usr/src/app`,
+`/var/app`, `/var/task`, and `/var/www`. The container runtime starts the
+supervisor from `/`; before direct or SSH children start, the supervisor
+validates that existing parent directories are traversable by the resolved
+identity, creates missing parents with mode `0755`, and transfers ownership of
+only the workspace directory to the completed UID/GID. Image-provided contents
+and nested mounts retain their ownership. The resolved workspace is also the
+child cwd and `HOME`, the automatic writable policy path, and Podman's managed
 workspace-volume mount target. Kubernetes/OpenShift keep their `/sandbox` PVC
 and `fsGroup` behavior, and VM keeps its `/sandbox` guest initialization path.
 

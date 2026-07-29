@@ -440,9 +440,12 @@ OpenShell creates the resolved directory when needed and transfers ownership of
 only that directory to the completed UID/GID. Existing image contents and
 nested bind or volume mounts retain their ownership. The resolved workspace is
 the cwd and `HOME` for direct and SSH children. Protected system trees and
-OpenShell-reserved paths cannot become workspaces. The supervisor itself starts
-from `/`, so a missing or invalid workspace is handled during readiness instead
-of preventing the container from starting.
+OpenShell-reserved paths cannot become workspaces. OpenShell protects `/usr`
+and `/var` except for `/usr/src/app`, `/var/app`, `/var/task`, `/var/www`, and
+their descendants. Existing workspace parents must be traversable by the
+resolved identity; OpenShell creates missing parents with mode `0755`. The
+supervisor itself starts from `/`, so a missing or invalid workspace is handled
+during readiness instead of preventing the container from starting.
 
 Sandbox creation fails before readiness if a required `USER` component is
 missing, malformed, unknown, ambiguous, or resolves to UID/GID 0. An image

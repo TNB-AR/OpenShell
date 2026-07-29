@@ -20,7 +20,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(any(test, unix))]
 use std::path::Path;
 use std::path::PathBuf;
@@ -1306,8 +1306,9 @@ fn prepare_oci_workspace_with(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    let last_component = components.len().saturating_sub(1);
     let mut current = PathBuf::from("/");
-    for component in components {
+    for (index, component) in components.into_iter().enumerate() {
         current.push(component);
         match std::fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -1322,9 +1323,18 @@ fn prepare_oci_workspace_with(
                     current.display()
                 ));
             }
-            Ok(_) => {}
+            Ok(metadata) => {
+                if index != last_component && !identity_can_traverse(&metadata, uid, gid) {
+                    return Err(miette::miette!(
+                        "workspace parent '{}' is not traversable by the sandbox identity",
+                        current.display()
+                    ));
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 std::fs::create_dir(&current).into_diagnostic()?;
+                std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o755))
+                    .into_diagnostic()?;
             }
             Err(error) => return Err(error).into_diagnostic(),
         }
@@ -1339,6 +1349,24 @@ fn prepare_oci_workspace_with(
             .into_diagnostic()?;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn identity_can_traverse(metadata: &std::fs::Metadata, uid: Option<Uid>, gid: Option<Gid>) -> bool {
+    let user_id = uid.unwrap_or_else(nix::unistd::geteuid).as_raw();
+    if user_id == 0 {
+        return true;
+    }
+
+    let group_id = gid.unwrap_or_else(nix::unistd::getegid).as_raw();
+    let mode = metadata.permissions().mode();
+    if metadata.uid() == user_id {
+        mode & 0o100 != 0
+    } else if metadata.gid() == group_id {
+        mode & 0o010 != 0
+    } else {
+        mode & 0o001 != 0
+    }
 }
 
 #[cfg(unix)]
@@ -2660,6 +2688,36 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn prepare_oci_workspace_rejects_inaccessible_existing_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap().join("workspace");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let metadata = std::fs::symlink_metadata(&parent).unwrap();
+        let different_user = Uid::from_raw(metadata.uid().wrapping_add(1));
+        let different_group = Gid::from_raw(metadata.gid().wrapping_add(1));
+        let root = parent.join("project");
+
+        let error = prepare_oci_workspace_with(
+            &root,
+            Some(different_user),
+            Some(different_group),
+            &|_, _, _| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("is not traversable"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !root.exists(),
+            "workspace must not be created below an inaccessible parent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn prepare_oci_workspace_rejects_non_directory_root() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap().join("sandbox");
@@ -2730,6 +2788,14 @@ mod tests {
         .expect("missing OCI workspace should be created");
 
         assert!(missing.is_dir());
+        assert_eq!(
+            std::fs::symlink_metadata(missing.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
         assert_eq!(*chowned.lock().unwrap(), vec![missing]);
     }
 
