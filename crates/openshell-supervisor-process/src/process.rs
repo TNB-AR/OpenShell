@@ -1267,8 +1267,13 @@ fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result
 }
 
 #[cfg(unix)]
-fn prepare_oci_workspace(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<()> {
-    prepare_oci_workspace_with(root, uid, gid, &nix::unistd::chown)
+fn prepare_oci_workspace(
+    root: &Path,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+    supplementary_gids: &[Gid],
+) -> Result<()> {
+    prepare_oci_workspace_with(root, uid, gid, supplementary_gids, &nix::unistd::chown)
 }
 
 /// Prepare only the resolved `OpenShell` workspace directory itself.
@@ -1280,6 +1285,7 @@ fn prepare_oci_workspace_with(
     root: &Path,
     uid: Option<Uid>,
     gid: Option<Gid>,
+    supplementary_gids: &[Gid],
     do_chown: &impl Fn(&Path, Option<Uid>, Option<Gid>) -> nix::Result<()>,
 ) -> Result<()> {
     let root_str = root
@@ -1324,7 +1330,9 @@ fn prepare_oci_workspace_with(
                 ));
             }
             Ok(metadata) => {
-                if index != last_component && !identity_can_traverse(&metadata, uid, gid) {
+                if index != last_component
+                    && !identity_can_traverse(&metadata, uid, gid, supplementary_gids)
+                {
                     return Err(miette::miette!(
                         "workspace parent '{}' is not traversable by the sandbox identity",
                         current.display()
@@ -1352,7 +1360,12 @@ fn prepare_oci_workspace_with(
 }
 
 #[cfg(unix)]
-fn identity_can_traverse(metadata: &std::fs::Metadata, uid: Option<Uid>, gid: Option<Gid>) -> bool {
+fn identity_can_traverse(
+    metadata: &std::fs::Metadata,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+    supplementary_gids: &[Gid],
+) -> bool {
     let user_id = uid.unwrap_or_else(nix::unistd::geteuid).as_raw();
     if user_id == 0 {
         return true;
@@ -1362,11 +1375,44 @@ fn identity_can_traverse(metadata: &std::fs::Metadata, uid: Option<Uid>, gid: Op
     let mode = metadata.permissions().mode();
     if metadata.uid() == user_id {
         mode & 0o100 != 0
-    } else if metadata.gid() == group_id {
+    } else if metadata.gid() == group_id
+        || supplementary_gids
+            .iter()
+            .any(|supplementary_gid| supplementary_gid.as_raw() == metadata.gid())
+    {
         mode & 0o010 != 0
     } else {
         mode & 0o001 != 0
     }
+}
+
+#[cfg(not(any(
+    target_os = "aix",
+    target_os = "haiku",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "redox",
+    target_os = "solaris"
+)))]
+fn named_user_supplementary_groups(user_name: &str, primary_gid: Gid) -> Result<Vec<Gid>> {
+    let user_name = CString::new(user_name).map_err(|_| miette::miette!("Invalid user name"))?;
+    nix::unistd::getgrouplist(user_name.as_c_str(), primary_gid).into_diagnostic()
+}
+
+#[cfg(any(
+    target_os = "aix",
+    target_os = "haiku",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "redox",
+    target_os = "solaris"
+))]
+#[allow(clippy::unnecessary_wraps)]
+fn named_user_supplementary_groups(_user_name: &str, _primary_gid: Gid) -> Result<Vec<Gid>> {
+    // Privilege dropping does not call initgroups on these targets.
+    Ok(Vec::new())
 }
 
 #[cfg(unix)]
@@ -1483,6 +1529,23 @@ pub fn prepare_filesystem_with_identity(
         },
     };
 
+    let supplementary_gids = match user_name {
+        Some(name) if name.parse::<u32>().is_err() && resolved_identity.uid().is_none() => {
+            let primary_gid = if let Some(gid) = gid {
+                gid
+            } else {
+                let uid =
+                    uid.ok_or_else(|| miette::miette!("Failed to resolve sandbox user '{name}'"))?;
+                User::from_uid(uid)
+                    .into_diagnostic()?
+                    .ok_or_else(|| miette::miette!("Failed to resolve user from UID {uid}"))?
+                    .gid
+            };
+            named_user_supplementary_groups(name, primary_gid)?
+        }
+        _ => Vec::new(),
+    };
+
     // Docker and Podman own workspace resolution and must make the selected
     // root usable by the final effective identity, including when both policy
     // identity fields were explicit. Validate it before processing any
@@ -1494,7 +1557,7 @@ pub fn prepare_filesystem_with_identity(
         })?;
         let workspace = Path::new(workspace);
         info!(path = %workspace.display(), ?uid, ?gid, "Preparing resolved workspace");
-        prepare_oci_workspace(workspace, uid, gid)?;
+        prepare_oci_workspace(workspace, uid, gid, &supplementary_gids)?;
     }
 
     // Create missing read_write paths and only chown the ones we created.
@@ -2593,6 +2656,7 @@ mod tests {
             &root,
             Some(nix::unistd::geteuid()),
             Some(nix::unistd::getegid()),
+            &[],
             &fake_chown,
         )
         .expect("workspace root should be prepared");
@@ -2609,7 +2673,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-        prepare_oci_workspace_with(&root, None, None, &|_, _, _| Ok(()))
+        prepare_oci_workspace_with(&root, None, None, &[], &|_, _, _| Ok(()))
             .expect("read-only workspace root should be prepared");
 
         let mode = std::fs::symlink_metadata(&root)
@@ -2635,6 +2699,7 @@ mod tests {
             &link,
             Some(nix::unistd::geteuid()),
             Some(nix::unistd::getegid()),
+            &[],
         )
         .unwrap_err();
         assert!(
@@ -2659,6 +2724,7 @@ mod tests {
             &parent_link.join("workspace"),
             Some(nix::unistd::geteuid()),
             Some(nix::unistd::getegid()),
+            &[],
         )
         .unwrap_err();
         assert!(
@@ -2678,6 +2744,7 @@ mod tests {
             Path::new("/tmp/workspace/../escape"),
             Some(nix::unistd::geteuid()),
             Some(nix::unistd::getegid()),
+            &[],
         )
         .unwrap_err();
         assert!(
@@ -2702,6 +2769,7 @@ mod tests {
             &root,
             Some(different_user),
             Some(different_group),
+            &[],
             &|_, _, _| Ok(()),
         )
         .unwrap_err();
@@ -2718,6 +2786,53 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn prepare_oci_workspace_accepts_supplementary_group_parent() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o710)).unwrap();
+        let parent = dir.path().canonicalize().unwrap().join("workspace");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o710)).unwrap();
+        let metadata = std::fs::symlink_metadata(&parent).unwrap();
+        let different_user = Uid::from_raw(metadata.uid().wrapping_add(1));
+        let different_group = Gid::from_raw(metadata.gid().wrapping_add(1));
+        let supplementary_group = Gid::from_raw(metadata.gid());
+        let root = parent.join("project");
+
+        prepare_oci_workspace_with(
+            &root,
+            Some(different_user),
+            Some(different_group),
+            &[supplementary_group],
+            &|_, _, _| Ok(()),
+        )
+        .expect("supplementary group execute permission should allow traversal");
+
+        assert!(root.is_dir());
+    }
+
+    #[cfg(not(any(
+        target_os = "aix",
+        target_os = "haiku",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "redox",
+        target_os = "solaris"
+    )))]
+    #[test]
+    fn named_user_supplementary_groups_include_primary_group() {
+        let user = User::from_uid(nix::unistd::geteuid())
+            .expect("resolve current UID")
+            .expect("current user exists");
+
+        let groups = named_user_supplementary_groups(&user.name, user.gid)
+            .expect("resolve named-user supplementary groups");
+
+        assert!(groups.contains(&user.gid));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn prepare_oci_workspace_rejects_non_directory_root() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap().join("sandbox");
@@ -2727,6 +2842,7 @@ mod tests {
             &root,
             Some(nix::unistd::geteuid()),
             Some(nix::unistd::getegid()),
+            &[],
         )
         .unwrap_err();
         assert!(
@@ -2749,6 +2865,7 @@ mod tests {
             &root,
             Some(nix::unistd::geteuid()),
             Some(nix::unistd::getegid()),
+            &[],
             &fake_chown,
         )
         .unwrap_err();
@@ -2783,6 +2900,7 @@ mod tests {
             &missing,
             Some(nix::unistd::geteuid()),
             Some(nix::unistd::getegid()),
+            &[],
             &fake_chown,
         )
         .expect("missing OCI workspace should be created");
