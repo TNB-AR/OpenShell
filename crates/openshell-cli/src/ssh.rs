@@ -766,8 +766,8 @@ fn local_upload_path_is_file_like(path: &Path) -> bool {
 /// sandbox.  Callers are responsible for splitting the destination path so
 /// that `dest_dir` is always a directory.
 ///
-/// When `dest_dir` is `None`, the canonical remote workspace is discovered
-/// from the SSH session and used as the extraction target.
+/// When `dest_dir` is `None`, tar extracts relative to the SSH session's
+/// working directory.
 async fn ssh_tar_upload(
     server: &str,
     name: &str,
@@ -778,13 +778,7 @@ async fn ssh_tar_upload(
 ) -> Result<()> {
     let session = ssh_session_config(server, name, tls, workspace).await?;
 
-    let discovered_workspace;
-    let dest_dir = if let Some(dest_dir) = dest_dir {
-        dest_dir
-    } else {
-        discovered_workspace = discover_workspace_root(&session).await?;
-        &discovered_workspace
-    };
+    let dest_dir = dest_dir.unwrap_or(".");
     let escaped_dest = shell_escape(dest_dir);
 
     let mut ssh = ssh_base_command(&session.proxy_command);
@@ -903,35 +897,49 @@ fn is_under_workspace(path: &str, workspace_root: &str) -> bool {
     path == workspace_root || path.starts_with(&format!("{workspace_root}/"))
 }
 
-/// Resolve every symlink in `sandbox_path` on the sandbox side and refuse the
-/// result if it lands outside the discovered workspace root.
+/// Discover the workspace root and resolve every symlink in `sandbox_path` in
+/// one SSH probe, then refuse the result if it lands outside the workspace.
 ///
 /// The lexical guard in `validate_sandbox_source_path` cannot see symlinks; a
 /// workspace path through `etc-link -> /etc` clears the lexical check but
 /// would still leak `/etc/passwd` once `tar -C` follows the link. Resolving
 /// symlinks on the remote side and re-validating closes that gap. The returned
 /// fully-resolved path is what the caller should hand to probe and tar
-/// invocations.
+/// invocations. Combining discovery and resolution also keeps downloads within
+/// the gateway's three-connection limit: this probe, the type probe, and tar.
 async fn resolve_sandbox_source_path(
     session: &SshSessionConfig,
     sandbox_path: &str,
-    workspace_root: &str,
 ) -> Result<String> {
-    let resolve_cmd = format!("realpath -e -- {path}", path = shell_escape(sandbox_path));
-    let resolved = ssh_run_capture_stdout(session, &resolve_cmd)
+    let resolve_cmd = format!(
+        "pwd -P && realpath -e -- {path}",
+        path = shell_escape(sandbox_path)
+    );
+    let output = ssh_run_capture_stdout(session, &resolve_cmd)
         .await
         .wrap_err_with(|| format!("failed to resolve sandbox source path '{sandbox_path}'"))?;
+    let (workspace_root, resolved) = output.split_once('\n').ok_or_else(|| {
+        miette::miette!("unexpected response while resolving sandbox source path '{sandbox_path}'")
+    })?;
+    if resolved.contains('\n') {
+        return Err(miette::miette!(
+            "unexpected response while resolving sandbox source path '{sandbox_path}'"
+        ));
+    }
+
+    let workspace_root = validate_discovered_workspace_root(workspace_root)?;
+    validate_sandbox_source_path(sandbox_path, &workspace_root)?;
     if resolved.is_empty() {
         return Err(miette::miette!(
             "sandbox source path '{sandbox_path}' does not exist"
         ));
     }
-    if !is_under_workspace(&resolved, workspace_root) {
+    if !is_under_workspace(resolved, &workspace_root) {
         return Err(miette::miette!(
             "sandbox source path '{sandbox_path}' resolves to '{resolved}', outside the sandbox workspace ({workspace_root})"
         ));
     }
-    Ok(resolved)
+    Ok(resolved.to_string())
 }
 
 /// Resolve the host-side target path for a downloaded *file*, following
@@ -962,7 +970,7 @@ fn resolve_file_download_target(
 ///
 /// Files are streamed as a tar archive to `ssh ... tar xf - -C <dest>` on
 /// the sandbox side.  When `dest` is `None`, files are uploaded to the
-/// discovered sandbox working directory.
+/// SSH session's working directory.
 #[allow(clippy::too_many_arguments)]
 pub async fn sandbox_sync_up_files(
     server: &str,
@@ -994,7 +1002,7 @@ pub async fn sandbox_sync_up_files(
 
 /// Push a local path (file or directory) into a sandbox using tar-over-SSH.
 ///
-/// When `sandbox_path` is `None`, files are uploaded to the discovered sandbox
+/// When `sandbox_path` is `None`, files are uploaded to the SSH session's
 /// working directory. When uploading a single file to an explicit destination
 /// that does not end with `/`, the destination is treated as a file path: the
 /// parent directory is created and the file is written with the destination's
@@ -1202,10 +1210,7 @@ pub async fn sandbox_sync_down(
     workspace: &str,
 ) -> Result<()> {
     let session = ssh_session_config(server, name, tls, workspace).await?;
-    let workspace_root = discover_workspace_root(&session).await?;
-    let sandbox_path = validate_sandbox_source_path(sandbox_path, &workspace_root)?;
-    let sandbox_path =
-        resolve_sandbox_source_path(&session, &sandbox_path, &workspace_root).await?;
+    let sandbox_path = resolve_sandbox_source_path(&session, sandbox_path).await?;
     let kind = probe_sandbox_source_kind(&session, &sandbox_path).await?;
 
     match kind {
