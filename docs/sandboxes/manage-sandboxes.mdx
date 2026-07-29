@@ -397,14 +397,16 @@ openshell sandbox upload my-sandbox ./src
 
 When you omit the destination, OpenShell discovers the sandbox's working
 directory and uploads there. For a named local directory, OpenShell preserves
-the basename, matching `scp -r` and `cp -r`.
+the basename, matching `scp -r` and `cp -r`. If that directory already exists,
+the upload merges into it and overwrites matching entries without deleting
+unrelated entries.
 
 OpenShell preserves symlinks during upload. A symlink arrives in the sandbox as a symlink with the same target path instead of an expanded copy of the target file or directory. Dangling symlinks are also preserved.
 
 Download files from the sandbox to your host:
 
 ```shell
-openshell sandbox download my-sandbox /sandbox/output ./local
+openshell sandbox download my-sandbox output ./local
 ```
 
 When the sandbox-side source is a single file, the destination follows `cp`-style placement: if the destination already exists as a directory or ends with `/`, the file lands inside it as `<dest>/<basename>`; otherwise the file is written at the exact destination path.
@@ -412,9 +414,9 @@ When the sandbox-side source is a single file, the destination follows `cp`-styl
 The CLI discovers the sandbox's canonical working directory and only allows
 sandbox-side sources that resolve inside it. Paths that escape lexically, such
 as `/etc/passwd` or `/sandbox/../etc/passwd`, and paths that escape through a
-symlink are refused before any data is transferred. Use the absolute workspace
-path reported by `pwd -P` for images that declare a different OCI working
-directory.
+symlink are refused before any data is transferred. Relative sources are
+resolved from the working directory; absolute sources within the same canonical
+directory are also accepted.
 
 <Note>
 You can also upload files at creation time with the `--upload` flag on

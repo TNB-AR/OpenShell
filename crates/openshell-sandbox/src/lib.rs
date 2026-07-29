@@ -189,9 +189,9 @@ pub async fn run_sandbox(
     // OpenShift retain their authoritative numeric pair; Docker and Podman
     // fill only omitted policy fields from OCI Config.User.
     #[cfg(unix)]
-    let (resolved_process_identity, workspace_home) = {
+    let (resolved_process_identity, workdir_is_home) = {
         let driver_identity = openshell_supervisor_process::identity::DriverIdentity::from_env()?;
-        let workspace_home = matches!(
+        let workdir_is_home = matches!(
             &driver_identity,
             openshell_supervisor_process::identity::DriverIdentity::OciUser { .. }
         );
@@ -199,10 +199,10 @@ pub async fn run_sandbox(
             &mut policy,
             &driver_identity,
         )?;
-        (resolved, workspace_home)
+        (resolved, workdir_is_home)
     };
     #[cfg(not(unix))]
-    let (resolved_process_identity, workspace_home) = (
+    let (resolved_process_identity, workdir_is_home) = (
         openshell_supervisor_process::process::ResolvedProcessIdentity::default(),
         false,
     );
@@ -691,7 +691,7 @@ pub async fn run_sandbox(
             program,
             args,
             workdir.as_deref(),
-            workspace_home,
+            workdir_is_home,
             timeout_secs,
             interactive,
             sandbox_id.as_deref(),
@@ -1510,7 +1510,7 @@ mod baseline_tests {
     }
 
     #[test]
-    fn baseline_read_write_uses_dynamic_workdir_instead_of_sandbox() {
+    fn baseline_read_write_does_not_hardcode_sandbox() {
         let (_ro, rw) = baseline_enrichment_paths();
         assert!(rw.contains(&"/tmp".to_string()));
         assert!(!rw.contains(&"/sandbox".to_string()));

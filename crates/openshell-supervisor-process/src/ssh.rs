@@ -112,7 +112,7 @@ pub async fn run_ssh_server(
     ready_tx: tokio::sync::oneshot::Sender<Result<()>>,
     policy: SandboxPolicy,
     workdir: Option<String>,
-    workspace_home: bool,
+    workdir_is_home: bool,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
     ca_file_paths: Option<(PathBuf, PathBuf)>,
@@ -158,7 +158,7 @@ pub async fn run_ssh_server(
                 config,
                 policy,
                 workdir,
-                workspace_home,
+                workdir_is_home,
                 netns_fd,
                 proxy_url,
                 ca_paths,
@@ -188,7 +188,7 @@ async fn handle_connection(
     config: Arc<russh::server::Config>,
     policy: SandboxPolicy,
     workdir: Option<String>,
-    workspace_home: bool,
+    workdir_is_home: bool,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
@@ -214,7 +214,7 @@ async fn handle_connection(
     let handler = SshHandler::new(
         policy,
         workdir,
-        workspace_home,
+        workdir_is_home,
         netns_fd,
         proxy_url,
         ca_file_paths,
@@ -245,7 +245,7 @@ struct ChannelState {
 struct SshHandler {
     policy: SandboxPolicy,
     workdir: Option<String>,
-    workspace_home: bool,
+    workdir_is_home: bool,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
@@ -261,7 +261,7 @@ impl SshHandler {
     fn new(
         policy: SandboxPolicy,
         workdir: Option<String>,
-        workspace_home: bool,
+        workdir_is_home: bool,
         netns_fd: Option<RawFd>,
         proxy_url: Option<String>,
         ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
@@ -273,7 +273,7 @@ impl SshHandler {
         Self {
             policy,
             workdir,
-            workspace_home,
+            workdir_is_home,
             netns_fd,
             proxy_url,
             ca_file_paths,
@@ -496,7 +496,7 @@ impl russh::server::Handler for SshHandler {
             let input_sender = spawn_pipe_exec(
                 &self.policy,
                 self.workdir.clone(),
-                self.workspace_home,
+                self.workdir_is_home,
                 Some("/usr/lib/openssh/sftp-server".to_string()),
                 session.handle(),
                 channel,
@@ -594,7 +594,7 @@ impl SshHandler {
             let (pty_master, input_sender) = spawn_pty_shell(
                 &self.policy,
                 self.workdir.clone(),
-                self.workspace_home,
+                self.workdir_is_home,
                 command,
                 &pty,
                 handle,
@@ -616,7 +616,7 @@ impl SshHandler {
             let input_sender = spawn_pipe_exec(
                 &self.policy,
                 self.workdir.clone(),
-                self.workspace_home,
+                self.workdir_is_home,
                 command,
                 handle,
                 channel,
@@ -712,7 +712,7 @@ impl Default for PtyRequest {
 /// For numeric UIDs, there is no passwd entry, so the default remains
 /// `("{uid}", "/sandbox")`. Docker and Podman replace that default with their
 /// resolved image workspace.
-fn session_user_and_home(policy: &SandboxPolicy, workspace_home: Option<&str>) -> (String, String) {
+fn session_user_and_home(policy: &SandboxPolicy, workdir_home: Option<&str>) -> (String, String) {
     let (user, default_home) = match policy.process.run_as_user.as_deref() {
         Some(user) if !user.is_empty() => {
             // Numeric UID — no passwd entry expected; use default HOME.
@@ -732,7 +732,7 @@ fn session_user_and_home(policy: &SandboxPolicy, workspace_home: Option<&str>) -
         }
         _ => ("sandbox".to_string(), "/sandbox".to_string()),
     };
-    let home = workspace_home.map_or(default_home, str::to_string);
+    let home = workdir_home.map_or(default_home, str::to_string);
     (user, home)
 }
 
@@ -787,7 +787,7 @@ fn apply_child_env(
 fn spawn_pty_shell(
     policy: &SandboxPolicy,
     workdir: Option<String>,
-    workspace_home: bool,
+    workdir_is_home: bool,
     command: Option<String>,
     pty: &PtyRequest,
     handle: Handle,
@@ -840,7 +840,7 @@ fn spawn_pty_shell(
     // falling back to "sandbox" / "/sandbox" for backward compatibility.
     let (session_user, session_home) = session_user_and_home(
         policy,
-        if workspace_home {
+        if workdir_is_home {
             workdir.as_deref()
         } else {
             None
@@ -968,7 +968,7 @@ fn spawn_pty_shell(
 fn spawn_pipe_exec(
     policy: &SandboxPolicy,
     workdir: Option<String>,
-    workspace_home: bool,
+    workdir_is_home: bool,
     command: Option<String>,
     handle: Handle,
     channel: ChannelId,
@@ -1002,7 +1002,7 @@ fn spawn_pipe_exec(
 
     let (session_user, session_home) = session_user_and_home(
         policy,
-        if workspace_home {
+        if workdir_is_home {
             workdir.as_deref()
         } else {
             None

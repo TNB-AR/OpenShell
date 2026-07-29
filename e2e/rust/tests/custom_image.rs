@@ -119,13 +119,13 @@ async fn sandbox_from_custom_dockerfile() {
     let transfer_download = tmpdir.path().join("workspace-transfer-downloaded.txt");
     guard
         .download(
-            "/workspace/project/workspace-transfer.txt",
+            "workspace-transfer.txt",
             transfer_download
                 .to_str()
                 .expect("download destination path is UTF-8"),
         )
         .await
-        .expect("download should accept the OCI workspace");
+        .expect("download should resolve relative to the OCI workspace");
     assert_eq!(
         fs::read_to_string(transfer_download).expect("read downloaded transfer fixture"),
         "workspace-transfer-ok"

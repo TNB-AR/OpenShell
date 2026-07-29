@@ -97,6 +97,9 @@ pub fn validate_mount_subpath(subpath: &str) -> Result<(), String> {
 }
 
 /// Validate a container-side mount target for user-supplied driver mounts.
+///
+/// Workspace collisions depend on the inspected image's resolved working
+/// directory and are checked separately by `validate_workspace_mount_target`.
 pub fn validate_container_mount_target(target: &str) -> Result<(), String> {
     if target.is_empty() {
         return Err("mount target must not be empty".to_string());

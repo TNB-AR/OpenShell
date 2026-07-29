@@ -7,7 +7,6 @@ use crate::tls::{TlsOptions, grpc_client};
 use miette::{IntoDiagnostic, Result, WrapErr};
 #[cfg(unix)]
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
-use openshell_core::ObjectId;
 use openshell_core::forward::{
     ForwardSpec, build_proxy_command, format_gateway_url, resolve_ssh_gateway, shell_escape,
     validate_ssh_session_response, write_forward_pid,
@@ -16,6 +15,7 @@ use openshell_core::proto::{
     CreateSshSessionRequest, GetSandboxRequest, SshRelayTarget, TcpForwardFrame, TcpForwardInit,
     tcp_forward_init,
 };
+use openshell_core::{ObjectId, driver_mounts};
 use owo_colors::OwoColorize;
 use std::fs;
 use std::future::Future;
@@ -867,34 +867,34 @@ fn lexical_clean_absolute_path(path: &str) -> Option<String> {
     Some(out)
 }
 
-/// Validate that a sandbox-side source path passed to `sandbox download`
-/// resolves under the sandbox writable root.
+/// Resolve a sandbox-side source path passed to `sandbox download` under the
+/// sandbox writable root.
 ///
 /// Returns the cleaned, traversal-resolved path on success. Refuses any
-/// path that lexically escapes the discovered workspace root with a
-/// user-facing error.
+/// path that lexically escapes the discovered workspace root with a user-facing
+/// error. Relative paths are interpreted from the workspace root.
 ///
 /// This is a lexical guard only — it does not follow symlinks. Call
 /// `resolve_sandbox_source_path` after this on any path that will be passed
 /// to a subsequent SSH I/O operation, so a workspace symlink to `/etc` cannot
 /// leak files outside the workspace.
-fn validate_sandbox_source_path(path: &str, workspace_root: &str) -> Result<String> {
+fn validate_sandbox_source_path(workspace_root: &str, path: &str) -> Result<String> {
     if path.is_empty() {
         return Err(miette::miette!("sandbox source path is empty"));
     }
-    let cleaned = lexical_clean_absolute_path(path)
-        .ok_or_else(|| miette::miette!("sandbox source path must be absolute (got '{path}')"))?;
-    if !is_under_workspace(&cleaned, workspace_root) {
+    let candidate = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("{workspace_root}/{path}")
+    };
+    let cleaned = lexical_clean_absolute_path(&candidate)
+        .ok_or_else(|| miette::miette!("sandbox source path is invalid (got '{path}')"))?;
+    if !driver_mounts::path_is_or_under(Path::new(&cleaned), Path::new(workspace_root)) {
         return Err(miette::miette!(
             "sandbox source path '{path}' is outside the sandbox workspace ({workspace_root})"
         ));
     }
     Ok(cleaned)
-}
-
-/// Pure helper: is `path` equal to the workspace root or a descendant of it?
-fn is_under_workspace(path: &str, workspace_root: &str) -> bool {
-    path == workspace_root || path.starts_with(&format!("{workspace_root}/"))
 }
 
 /// Discover the workspace root and resolve every symlink in `sandbox_path` in
@@ -928,13 +928,13 @@ async fn resolve_sandbox_source_path(
     }
 
     let workspace_root = validate_discovered_workspace_root(workspace_root)?;
-    validate_sandbox_source_path(sandbox_path, &workspace_root)?;
+    validate_sandbox_source_path(&workspace_root, sandbox_path)?;
     if resolved.is_empty() {
         return Err(miette::miette!(
             "sandbox source path '{sandbox_path}' does not exist"
         ));
     }
-    if !is_under_workspace(resolved, &workspace_root) {
+    if !driver_mounts::path_is_or_under(Path::new(resolved), Path::new(&workspace_root)) {
         return Err(miette::miette!(
             "sandbox source path '{sandbox_path}' resolves to '{resolved}', outside the sandbox workspace ({workspace_root})"
         ));
@@ -1199,8 +1199,8 @@ async fn probe_sandbox_source_kind(
 ///   behaviour for the directory-source case.
 ///
 /// The sandbox source path is also subjected to a workspace-boundary check
-/// before any SSH command is issued; paths that lexically resolve outside
-/// the discovered workspace root are refused.
+/// before any file probe or archive command is issued; paths that resolve
+/// outside the discovered workspace root are refused.
 pub async fn sandbox_sync_down(
     server: &str,
     name: &str,
@@ -2006,42 +2006,50 @@ mod tests {
     fn validate_sandbox_source_path_accepts_workspace_paths() {
         let workspace_root = "/workspace/project";
         assert_eq!(
-            validate_sandbox_source_path("/workspace/project/file.txt", workspace_root).unwrap(),
+            validate_sandbox_source_path(workspace_root, "/workspace/project/file.txt").unwrap(),
             "/workspace/project/file.txt"
         );
         assert_eq!(
             validate_sandbox_source_path(
-                "/workspace/project/.agent/workspace/hello.txt",
-                workspace_root
+                workspace_root,
+                "/workspace/project/.agent/workspace/hello.txt"
             )
             .unwrap(),
             "/workspace/project/.agent/workspace/hello.txt"
         );
         assert_eq!(
-            validate_sandbox_source_path("/workspace/project", workspace_root).unwrap(),
+            validate_sandbox_source_path(workspace_root, "/workspace/project").unwrap(),
             "/workspace/project"
         );
         assert_eq!(
-            validate_sandbox_source_path("/workspace/project/", workspace_root).unwrap(),
+            validate_sandbox_source_path(workspace_root, "/workspace/project/").unwrap(),
             "/workspace/project"
         );
         assert_eq!(
-            validate_sandbox_source_path("/workspace/project/sub/../file", workspace_root).unwrap(),
+            validate_sandbox_source_path(workspace_root, "/workspace/project/sub/../file").unwrap(),
             "/workspace/project/file"
+        );
+        assert_eq!(
+            validate_sandbox_source_path(workspace_root, "output/file.txt").unwrap(),
+            "/workspace/project/output/file.txt"
+        );
+        assert_eq!(
+            validate_sandbox_source_path(workspace_root, "./output/../file.txt").unwrap(),
+            "/workspace/project/file.txt"
         );
     }
 
     #[test]
     fn validate_sandbox_source_path_rejects_traversal_and_escapes() {
         let workspace_root = "/workspace/project";
-        let traversal = validate_sandbox_source_path("/etc/passwd", workspace_root).unwrap_err();
+        let traversal = validate_sandbox_source_path(workspace_root, "/etc/passwd").unwrap_err();
         assert!(
             format!("{traversal}").contains("outside the sandbox workspace"),
             "unexpected error: {traversal}"
         );
 
         let parent_escape =
-            validate_sandbox_source_path("/workspace/project/../../etc/passwd", workspace_root)
+            validate_sandbox_source_path(workspace_root, "/workspace/project/../../etc/passwd")
                 .unwrap_err();
         assert!(
             format!("{parent_escape}").contains("outside the sandbox workspace"),
@@ -2049,46 +2057,19 @@ mod tests {
         );
 
         let prefix_only =
-            validate_sandbox_source_path("/workspace/projected/secrets", workspace_root)
+            validate_sandbox_source_path(workspace_root, "/workspace/projected/secrets")
                 .unwrap_err();
         assert!(
             format!("{prefix_only}").contains("outside the sandbox workspace"),
             "unexpected error: {prefix_only}"
         );
 
-        let empty = validate_sandbox_source_path("", workspace_root).unwrap_err();
+        let empty = validate_sandbox_source_path(workspace_root, "").unwrap_err();
         assert!(format!("{empty}").contains("empty"));
 
-        let relative =
-            validate_sandbox_source_path("workspace/project/file", workspace_root).unwrap_err();
-        assert!(format!("{relative}").contains("must be absolute"));
-    }
-
-    #[test]
-    fn is_under_workspace_accepts_root_and_descendants() {
-        assert!(is_under_workspace(
-            "/workspace/project",
-            "/workspace/project"
-        ));
-        assert!(is_under_workspace(
-            "/workspace/project/file",
-            "/workspace/project"
-        ));
-        assert!(is_under_workspace(
-            "/workspace/project/sub/nested",
-            "/workspace/project"
-        ));
-    }
-
-    #[test]
-    fn is_under_workspace_rejects_outside_paths_and_prefix_collisions() {
-        assert!(!is_under_workspace("/etc/passwd", "/workspace/project"));
-        assert!(!is_under_workspace(
-            "/workspace/projected/secrets",
-            "/workspace/project"
-        ));
-        assert!(!is_under_workspace("/", "/workspace/project"));
-        assert!(!is_under_workspace("", "/workspace/project"));
+        let relative_escape =
+            validate_sandbox_source_path(workspace_root, "../../etc/passwd").unwrap_err();
+        assert!(format!("{relative_escape}").contains("outside the sandbox workspace"));
     }
 
     #[test]

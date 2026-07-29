@@ -530,7 +530,7 @@ impl ProcessHandle {
         program: &str,
         args: &[String],
         workdir: Option<&str>,
-        workspace_home: bool,
+        workdir_is_home: bool,
         interactive: bool,
         policy: &SandboxPolicy,
         resolved_identity: ResolvedProcessIdentity,
@@ -543,7 +543,7 @@ impl ProcessHandle {
             program,
             args,
             workdir,
-            workspace_home,
+            workdir_is_home,
             interactive,
             policy,
             resolved_identity,
@@ -565,7 +565,7 @@ impl ProcessHandle {
         program: &str,
         args: &[String],
         workdir: Option<&str>,
-        workspace_home: bool,
+        workdir_is_home: bool,
         interactive: bool,
         policy: &SandboxPolicy,
         resolved_identity: ResolvedProcessIdentity,
@@ -577,7 +577,7 @@ impl ProcessHandle {
             program,
             args,
             workdir,
-            workspace_home,
+            workdir_is_home,
             interactive,
             policy,
             resolved_identity,
@@ -593,7 +593,7 @@ impl ProcessHandle {
         program: &str,
         args: &[String],
         workdir: Option<&str>,
-        workspace_home: bool,
+        workdir_is_home: bool,
         interactive: bool,
         policy: &SandboxPolicy,
         resolved_identity: ResolvedProcessIdentity,
@@ -620,7 +620,7 @@ impl ProcessHandle {
 
         if let Some(dir) = workdir {
             cmd.current_dir(dir);
-            if workspace_home {
+            if workdir_is_home {
                 cmd.env("HOME", dir);
             }
         }
@@ -752,7 +752,7 @@ impl ProcessHandle {
         program: &str,
         args: &[String],
         workdir: Option<&str>,
-        workspace_home: bool,
+        workdir_is_home: bool,
         interactive: bool,
         policy: &SandboxPolicy,
         resolved_identity: ResolvedProcessIdentity,
@@ -776,7 +776,7 @@ impl ProcessHandle {
 
         if let Some(dir) = workdir {
             cmd.current_dir(dir);
-            if workspace_home {
+            if workdir_is_home {
                 cmd.env("HOME", dir);
             }
         }

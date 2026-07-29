@@ -2436,8 +2436,8 @@ fn build_container_create_body_for_image(
         working_dir: Some("/".to_string()),
         env: Some(build_environment_for_oci_user(sandbox, config, &image.user)),
         entrypoint: Some(vec![SUPERVISOR_MOUNT_PATH.to_string()]),
-        // Clear the image CMD so Docker does not append inherited args to the
-        // supervisor entrypoint.
+        // Replace the image CMD with the supervisor's resolved workspace
+        // argument so Docker cannot append inherited image arguments.
         cmd: Some(vec!["--workdir".to_string(), workspace_root]),
         labels: Some(labels),
         host_config: Some(HostConfig {

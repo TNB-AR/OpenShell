@@ -4066,7 +4066,8 @@ mod tests {
             "init container must not depend on a shell"
         );
 
-        // Agent container command should be overridden to the emptyDir path
+        // `--workdir` is optional for standalone supervisor invocations and
+        // has no implicit default, so Kubernetes must pass its fixed workspace.
         let command = pod_template["spec"]["containers"][0]["command"]
             .as_array()
             .expect("command should be set");
